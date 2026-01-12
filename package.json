@@ -1,0 +1,12 @@
+{
+  "name": "purple-box",
+  "version": "1.0.0",
+  "description": "Purple Box - Ephemeral messaging app",
+  "private": true,
+  "scripts": {
+    "test:live": "npx ts-node verify-deployment.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
