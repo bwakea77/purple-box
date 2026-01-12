@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { Server as SocketIOServer } from 'socket.io';
+import type { Server as SocketIOServer } from 'socket.io';
 import fastifySocketIO from 'fastify-socket.io';
 import { createRedisClient, createRedisAdapter } from './redis.js';
 import { handleMessage } from './messageHandler.js';
@@ -18,7 +18,7 @@ let redisClient: RedisClientType;
 let io: SocketIOServer;
 
 // Register Socket.io plugin
-fastify.register(fastifySocketIO, {
+fastify.register(fastifySocketIO as any, {
   cors: {
     origin: process.env.CORS_ORIGIN || '*',
     methods: ['GET', 'POST'],

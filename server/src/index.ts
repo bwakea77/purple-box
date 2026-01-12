@@ -77,11 +77,12 @@ const fastify = Fastify({
 // Initialize Redis client with zero persistence
 // Support REDIS_URL for cloud deployment (e.g., Redis Cloud, Railway, etc.)
 // Falls back to REDIS_HOST/REDIS_PORT for local development
+const RedisConstructor = Redis as any;
 const redis = process.env.REDIS_URL
-  ? new Redis(process.env.REDIS_URL, {
+  ? new RedisConstructor(process.env.REDIS_URL, {
       enableOfflineQueue: false,
     })
-  : new Redis({
+  : new RedisConstructor({
       host: process.env.REDIS_HOST || 'localhost',
       port: parseInt(process.env.REDIS_PORT || '6379'),
       // No persistence - ephemeral mode
@@ -96,7 +97,7 @@ fastify.register(fastifyCors, {
 });
 
 // Register Socket.io plugin
-fastify.register(fastifySocketIO, {
+fastify.register(fastifySocketIO as any, {
   cors: {
     origin: process.env.CORS_ORIGIN || '*',
     methods: ['GET', 'POST'],
@@ -470,10 +471,10 @@ fastify.ready(async () => {
     socket.on('disconnect', () => {
       // Find and remove userId from userSockets map
       const userId = Object.keys(userSockets).find(
-        (key) => userSockets[key].socketId === socket.id
+        (key) => userSockets[key]?.socketId === socket.id
       );
 
-      if (userId) {
+      if (userId && userSockets[userId]) {
         delete userSockets[userId];
         console.log(`[Server] User disconnected: ${userId} (socket: ${socket.id})`);
       } else {

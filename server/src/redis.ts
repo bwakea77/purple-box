@@ -1,4 +1,5 @@
-import { createClient, RedisClientType } from 'redis';
+import { createClient } from 'redis';
+import type { RedisClientType } from 'redis';
 import { createAdapter } from '@socket.io/redis-adapter';
 
 const REDIS_TTL_SECONDS = 60;

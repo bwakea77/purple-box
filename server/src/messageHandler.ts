@@ -1,5 +1,5 @@
-import { Server as SocketIOServer } from 'socket.io';
-import { RedisClientType } from 'redis';
+import type { Server as SocketIOServer } from 'socket.io';
+import type { RedisClientType } from 'redis';
 import { storeMessage } from './redis.js';
 
 interface MessagePayload {
