@@ -515,13 +515,13 @@ fastify.setNotFoundHandler(async (request, reply) => {
 });
 
 // Start server
-const PORT = parseInt(process.env.PORT || '3000');
+const port = parseInt(process.env.PORT || '3000');
 const HOST = process.env.HOST || '0.0.0.0';
 
 const start = async () => {
   try {
-    await fastify.listen({ port: PORT, host: HOST });
-    console.log(`[Server] Fastify server listening on ${HOST}:${PORT}`);
+    await fastify.listen({ port, host: HOST });
+    console.log(`Server is running on port ${port}`);
     console.log('[Server] Zero-persistence mode: All data is ephemeral');
   } catch (err) {
     fastify.log.error(err);
