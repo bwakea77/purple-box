@@ -1,0 +1,532 @@
+import 'dotenv/config';
+import Fastify from 'fastify';
+import fastifyCors from '@fastify/cors';
+import fastifySocketIO from 'fastify-socket.io';
+import Redis from 'ioredis';
+import { Expo } from 'expo-server-sdk';
+import type { Server as SocketIOServer, Socket } from 'socket.io';
+
+// Initialize Expo push notification service
+const expo = new Expo();
+
+// Data models
+interface UserProfile {
+  id: string;
+  phoneNumber: string;
+  publicKey: string;
+  pushToken: string | null;
+}
+
+interface OTPData {
+  code: string;
+  expiresAt: number;
+}
+
+// In-memory user socket mapping (zero persistence)
+// Maps userId to { socketId, publicKey, pushToken }
+interface UserSocketInfo {
+  socketId: string;
+  publicKey: string;
+  pushToken: string | null;
+  userId: string;
+}
+const userSockets: Record<string, UserSocketInfo> = {};
+
+// Helper functions
+function generateOTP(): string {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function generateSessionToken(userId: string): string {
+  // Simple token: just userId for MVP
+  return userId;
+}
+
+async function getUserByToken(token: string): Promise<UserProfile | null> {
+  try {
+    // Token is userId for MVP
+    const userId = token;
+    
+    // Get all user keys to find the one matching this userId
+    const keys = await redis.keys('user:*');
+    for (const key of keys) {
+      const userData = await redis.get(key);
+      if (userData) {
+        const user: UserProfile = JSON.parse(userData);
+        if (user.id === userId) {
+          return user;
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error('[Server] Error getting user by token:', error);
+    return null;
+  }
+}
+
+// Initialize Fastify
+const fastify = Fastify({
+  logger: {
+    level: 'info',
+    // Ensure no sensitive data is logged
+    redact: ['cipherText', 'message', 'payload', 'data'],
+  },
+});
+
+// Initialize Redis client with zero persistence
+// Support REDIS_URL for cloud deployment (e.g., Redis Cloud, Railway, etc.)
+// Falls back to REDIS_HOST/REDIS_PORT for local development
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, {
+      enableOfflineQueue: false,
+    })
+  : new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      // No persistence - ephemeral mode
+      enableOfflineQueue: false,
+    });
+
+// Register CORS plugin for HTTP routes
+fastify.register(fastifyCors, {
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true,
+});
+
+// Register Socket.io plugin
+fastify.register(fastifySocketIO, {
+  cors: {
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
+
+// Auth routes
+// POST /auth/request-otp
+fastify.post('/auth/request-otp', async (request, reply) => {
+  try {
+    const { phoneNumber } = request.body as { phoneNumber?: string };
+
+    if (!phoneNumber || typeof phoneNumber !== 'string') {
+      return reply.status(400).send({ success: false, error: 'Invalid phone number' });
+    }
+
+    // Generate 6-digit OTP code
+    const code = generateOTP();
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes from now
+
+    // Store OTP in Redis with TTL of 5 minutes (300 seconds)
+    const otpKey = `otp:${phoneNumber}`;
+    const otpData: OTPData = { code, expiresAt };
+    await redis.setex(otpKey, 300, JSON.stringify(otpData));
+
+    // Log the code to console (Mock SMS)
+    console.log(`[Server] OTP for ${phoneNumber}: ${code}`);
+
+    return { success: true };
+  } catch (error) {
+    console.error('[Server] Error requesting OTP:', error);
+    return reply.status(500).send({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to request OTP',
+    });
+  }
+});
+
+// POST /auth/verify-otp
+fastify.post('/auth/verify-otp', async (request, reply) => {
+  try {
+    const { phoneNumber, code, publicKey, pushToken } = request.body as {
+      phoneNumber?: string;
+      code?: string;
+      publicKey?: string;
+      pushToken?: string | null;
+    };
+
+    if (!phoneNumber || typeof phoneNumber !== 'string') {
+      return reply.status(400).send({ success: false, error: 'Invalid phone number' });
+    }
+
+    if (!code || typeof code !== 'string') {
+      return reply.status(400).send({ success: false, error: 'Invalid OTP code' });
+    }
+
+    if (!publicKey || typeof publicKey !== 'string') {
+      return reply.status(400).send({ success: false, error: 'Invalid public key' });
+    }
+
+    // Retrieve OTP from Redis
+    const otpKey = `otp:${phoneNumber}`;
+    const otpDataStr = await redis.get(otpKey);
+
+    if (!otpDataStr) {
+      return reply.status(400).send({ success: false, error: 'OTP not found or expired' });
+    }
+
+    const otpData: OTPData = JSON.parse(otpDataStr);
+
+    // Check if OTP matches
+    if (otpData.code !== code) {
+      return reply.status(400).send({ success: false, error: 'Invalid OTP code' });
+    }
+
+    // Check if OTP has expired
+    if (Date.now() > otpData.expiresAt) {
+      await redis.del(otpKey); // Clean up expired OTP
+      return reply.status(400).send({ success: false, error: 'OTP expired' });
+    }
+
+    // Delete OTP after successful verification
+    await redis.del(otpKey);
+
+    // Get or create user
+    const userKey = `user:${phoneNumber}`;
+    const existingUserStr = await redis.get(userKey);
+    
+    let userId: string;
+    if (existingUserStr) {
+      const existingUser: UserProfile = JSON.parse(existingUserStr);
+      userId = existingUser.id;
+      // Update user profile
+      const updatedUser: UserProfile = {
+        ...existingUser,
+        publicKey,
+        pushToken: pushToken || null,
+      };
+      await redis.set(userKey, JSON.stringify(updatedUser));
+    } else {
+      // Create new user
+      userId = `user_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      const newUser: UserProfile = {
+        id: userId,
+        phoneNumber,
+        publicKey,
+        pushToken: pushToken || null,
+      };
+      await redis.set(userKey, JSON.stringify(newUser));
+    }
+
+    // Generate session token
+    const token = generateSessionToken(userId);
+
+    return { success: true, token, userId };
+  } catch (error) {
+    console.error('[Server] Error verifying OTP:', error);
+    return reply.status(500).send({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to verify OTP',
+    });
+  }
+});
+
+// POST /contacts/sync
+fastify.post('/contacts/sync', async (request, reply) => {
+  try {
+    const { phoneNumbers } = request.body as { phoneNumbers?: string[] };
+
+    if (!phoneNumbers || !Array.isArray(phoneNumbers)) {
+      return reply.status(400).send({ success: false, error: 'Invalid phone numbers array' });
+    }
+
+    // Validate all phone numbers are strings
+    if (!phoneNumbers.every((num) => typeof num === 'string')) {
+      return reply.status(400).send({ success: false, error: 'All phone numbers must be strings' });
+    }
+
+    const foundUsers: Array<{ phoneNumber: string; publicKey: string; userId: string }> = [];
+
+    // Loop through each phone number and check if user exists in Redis
+    for (const phoneNumber of phoneNumbers) {
+      const userKey = `user:${phoneNumber}`;
+      const userDataStr = await redis.get(userKey);
+
+      if (userDataStr) {
+        try {
+          const user: UserProfile = JSON.parse(userDataStr);
+          // Only return users that match the provided numbers (privacy requirement)
+          foundUsers.push({
+            phoneNumber: user.phoneNumber,
+            publicKey: user.publicKey,
+            userId: user.id,
+          });
+        } catch (parseError) {
+          // Skip invalid JSON entries
+          console.error(`[Server] Error parsing user data for ${phoneNumber}:`, parseError);
+        }
+      }
+    }
+
+    return { success: true, users: foundUsers };
+  } catch (error) {
+    console.error('[Server] Error syncing contacts:', error);
+    return reply.status(500).send({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to sync contacts',
+    });
+  }
+});
+
+// Set up Socket.io after Fastify is ready
+fastify.ready(async () => {
+  const io = fastify.io;
+
+  // Socket.io connection handler
+  io.on('connection', (socket: Socket) => {
+    console.log(`[Server] Client connected: ${socket.id}`);
+
+    // Identify: Verify token and map userId to socket ID, public key, and push token, join room
+    socket.on('identify', async (payload: { token: string }) => {
+      try {
+        if (!payload || typeof payload !== 'object') {
+          socket.emit('error', { message: 'Invalid payload' });
+          return;
+        }
+
+        const { token } = payload;
+
+        if (!token || typeof token !== 'string') {
+          socket.emit('error', { message: 'Invalid token' });
+          return;
+        }
+
+        // Verify token against Redis
+        const user = await getUserByToken(token);
+
+        if (!user) {
+          socket.emit('error', { message: 'Invalid or expired token' });
+          return;
+        }
+
+        // Map userId to socket info (socketId, publicKey, pushToken, and userId)
+        userSockets[user.id] = {
+          socketId: socket.id,
+          publicKey: user.publicKey,
+          pushToken: user.pushToken,
+          userId: user.id,
+        };
+        
+        // Join room with userId
+        socket.join(user.id);
+        
+        console.log(`[Server] User identified: ${user.id} (phone: ${user.phoneNumber}, socket: ${socket.id}, pushToken: ${user.pushToken ? 'present' : 'none'})`);
+      } catch (error) {
+        console.error('[Server] Error in identify:', error instanceof Error ? error.message : 'Unknown error');
+        socket.emit('error', {
+          message: error instanceof Error ? error.message : 'Failed to identify',
+        });
+      }
+    });
+
+    // Send message: Append cipherText to Redis list with 60s TTL
+    socket.on('send_message', async (payload: { to: string; cipherText: string }) => {
+      try {
+        const { to, cipherText } = payload;
+
+        if (!to || !cipherText) {
+          socket.emit('error', { message: 'Missing required fields: to, cipherText' });
+          return;
+        }
+
+        // Store message in Redis list with key format: inbox:{userId}
+        // Use RPUSH to append to the list
+        const redisKey = `inbox:${to}`;
+        await redis.rpush(redisKey, cipherText);
+        
+        // CRITICAL: Refresh expiration to exactly 60 seconds on each push
+        await redis.expire(redisKey, 60);
+
+        // Emit box_status: 'FULL' to recipient's room
+        io.to(to).emit('box_status', 'FULL');
+
+        // Send push notification if recipient has a push token
+        const recipientInfo = userSockets[to];
+        if (recipientInfo && recipientInfo.pushToken) {
+          try {
+            // Validate push token format
+            if (Expo.isExpoPushToken(recipientInfo.pushToken)) {
+              await expo.sendPushNotificationsAsync([
+                {
+                  to: recipientInfo.pushToken,
+                  sound: 'default',
+                  title: 'Purple Box',
+                  body: 'The box is full. Empty it.',
+                  data: { boxStatus: 'FULL' },
+                },
+              ]);
+              console.log(`[Server] Push notification sent to: ${to}`);
+            } else {
+              console.log(`[Server] Invalid push token format for user: ${to}`);
+            }
+          } catch (error) {
+            console.error(`[Server] Error sending push notification to ${to}:`, error instanceof Error ? error.message : 'Unknown error');
+          }
+        }
+
+        console.log(`[Server] Message appended to inbox for user: ${to} (expires in 60s)`);
+      } catch (error) {
+        console.error('[Server] Error sending message:', error instanceof Error ? error.message : 'Unknown error');
+        socket.emit('error', {
+          message: error instanceof Error ? error.message : 'Failed to send message',
+        });
+      }
+    });
+
+    // Get public key: Look up user's public key
+    socket.on('get_public_key', (targetUserId: string, callback: (response: { success: boolean; publicKey?: string | null; error?: string }) => void) => {
+      try {
+        if (!targetUserId || typeof targetUserId !== 'string') {
+          callback({ success: false, error: 'Invalid target user ID' });
+          return;
+        }
+
+        // Look up the user in userSockets
+        const userInfo = userSockets[targetUserId];
+
+        if (!userInfo) {
+          // User is offline - try to get from Redis
+          getUserByToken(targetUserId)
+            .then((user) => {
+              if (user) {
+                callback({ success: true, publicKey: user.publicKey });
+              } else {
+                callback({ success: true, publicKey: null });
+              }
+            })
+            .catch(() => {
+              callback({ success: true, publicKey: null });
+            });
+          return;
+        }
+
+        // Return the public key
+        callback({ success: true, publicKey: userInfo.publicKey });
+
+        console.log(`[Server] Public key requested for user: ${targetUserId}`);
+      } catch (error) {
+        console.error('[Server] Error getting public key:', error instanceof Error ? error.message : 'Unknown error');
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to get public key',
+        });
+      }
+    });
+
+    // Get contacts: Return list of all connected user IDs
+    socket.on('get_contacts', (callback: (response: { success: boolean; contacts?: string[]; error?: string }) => void) => {
+      try {
+        // Return all user IDs (keys of userSockets)
+        const contacts = Object.keys(userSockets);
+        
+        callback({ success: true, contacts });
+        
+        console.log(`[Server] Contacts requested: ${contacts.length} users online`);
+      } catch (error) {
+        console.error('[Server] Error getting contacts:', error instanceof Error ? error.message : 'Unknown error');
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to get contacts',
+        });
+      }
+    });
+
+    // Fetch inbox: Retrieve all messages from Redis list, then delete the key
+    socket.on('fetch_inbox', async (userId: string, callback: (response: { success: boolean; messages?: string[]; error?: string }) => void) => {
+      try {
+        if (!userId || typeof userId !== 'string') {
+          callback({ success: false, error: 'Invalid user ID' });
+          return;
+        }
+
+        const redisKey = `inbox:${userId}`;
+        
+        // Retrieve all messages from Redis list (LRANGE 0 -1 gets all items)
+        const messages = await redis.lrange(redisKey, 0, -1);
+
+        if (!messages || messages.length === 0) {
+          callback({ success: true, messages: [] });
+          return;
+        }
+
+        // Immediately delete the inbox key (prevent re-reading)
+        await redis.del(redisKey);
+
+        // Return array of encrypted strings
+        callback({ success: true, messages });
+
+        console.log(`[Server] Inbox retrieved and deleted for user: ${userId} (${messages.length} messages)`);
+      } catch (error) {
+        console.error('[Server] Error fetching inbox:', error instanceof Error ? error.message : 'Unknown error');
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to retrieve inbox',
+        });
+      }
+    });
+
+    // Disconnect: Clean up userSockets map
+    socket.on('disconnect', () => {
+      // Find and remove userId from userSockets map
+      const userId = Object.keys(userSockets).find(
+        (key) => userSockets[key].socketId === socket.id
+      );
+
+      if (userId) {
+        delete userSockets[userId];
+        console.log(`[Server] User disconnected: ${userId} (socket: ${socket.id})`);
+      } else {
+        console.log(`[Server] Client disconnected: ${socket.id}`);
+      }
+    });
+  });
+
+  console.log('[Server] Socket.io initialized');
+});
+
+// Root endpoint
+fastify.get('/', async () => {
+  return {
+    name: 'Purple Box API',
+    version: '1.0.0',
+    endpoints: {
+      health: 'GET /health',
+      requestOTP: 'POST /auth/request-otp',
+      verifyOTP: 'POST /auth/verify-otp',
+      syncContacts: 'POST /contacts/sync',
+    },
+  };
+});
+
+// Health check endpoint
+fastify.get('/health', async () => {
+  return { status: 'ok', timestamp: new Date().toISOString() };
+});
+
+// 404 handler for unmatched routes
+fastify.setNotFoundHandler(async (request, reply) => {
+  return reply.status(404).send({
+    success: false,
+    error: 'Route not found',
+    path: request.url,
+    method: request.method,
+  });
+});
+
+// Start server
+const PORT = parseInt(process.env.PORT || '3000');
+const HOST = process.env.HOST || '0.0.0.0';
+
+const start = async () => {
+  try {
+    await fastify.listen({ port: PORT, host: HOST });
+    console.log(`[Server] Fastify server listening on ${HOST}:${PORT}`);
+    console.log('[Server] Zero-persistence mode: All data is ephemeral');
+  } catch (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+};
+
+start();

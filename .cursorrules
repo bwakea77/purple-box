@@ -1,0 +1,23 @@
+# PURPLE BOX - PROJECT RULES
+
+## core_principles
+1.  **BIFURCATED PERSISTENCE:**
+    * **Identity (Legal):** User accounts, Phone Numbers, Public Keys, and Auth Tokens MAY be persisted (Redis/SecureStore).
+    * **Content (Illegal):** Chat messages and message metadata must NEVER be saved to disk. RAM ONLY.
+2.  **LIFECYCLE:**
+    * **Auth State:** Persists across app restarts (WhatsApp style).
+    * **Chat State:** Wiped immediately on background/exit.
+3.  **PRIVACY:** Block screenshots.
+4.  **CRYPTO:** End-to-End Encryption using `tweetnacl`.
+
+## tech_stack
+-   **Client:** Expo, React Navigation, Zustand, Expo SecureStore.
+-   **Server:** Fastify, Redis (Used for both User DB and Ephemeral Message Queue).
+-   **Auth:** Phone Number + OTP (Mocked for MVP).
+
+## specific_behaviors
+-   **Registration:** Phone Number -> OTP -> Persistent Token.
+-   **Startup:** Check SecureStore for token. If valid -> Go to Box. If invalid -> Go to Login.
+-   **Data Structure:**
+    -   User Data (Redis): `user:{phoneNumber}` -> `{ userId, publicKey, pushToken }` (Persisted).
+    -   Inbox (Redis): `inbox:{userId}` -> List of messages (TTL 60s).
