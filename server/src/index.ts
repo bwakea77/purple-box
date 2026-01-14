@@ -5,6 +5,7 @@ import fastifySocketIO from 'fastify-socket.io';
 import Redis from 'ioredis';
 import { Expo } from 'expo-server-sdk';
 import type { Server as SocketIOServer, Socket } from 'socket.io';
+import { parsePhoneNumber } from 'libphonenumber-js';
 
 // Initialize Expo push notification service
 const expo = new Expo();
@@ -40,6 +41,41 @@ function generateOTP(): string {
 function generateSessionToken(userId: string): string {
   // Simple token: just userId for MVP
   return userId;
+}
+
+/**
+ * Normalize phone number to E.164 format
+ * This ensures consistency between registration and contact sync
+ */
+function normalizePhoneNumber(phoneNumber: string): string | null {
+  try {
+    // Try parsing with Tanzania as default country code, fallback to international format
+    let parsedNumber;
+    try {
+      // First try with Tanzania country code (TZ = +255)
+      parsedNumber = parsePhoneNumber(phoneNumber, 'TZ');
+    } catch {
+      // If parsing with country code fails, try without (for already formatted numbers)
+      try {
+        parsedNumber = parsePhoneNumber(phoneNumber);
+      } catch {
+        // If that also fails, try with digits only and country code
+        const digitsOnly = phoneNumber.replace(/\D/g, '');
+        if (digitsOnly.length < 10) {
+          return null; // Too short to be valid
+        }
+        parsedNumber = parsePhoneNumber(digitsOnly, 'TZ');
+      }
+    }
+
+    if (parsedNumber && parsedNumber.isValid()) {
+      return parsedNumber.format('E.164');
+    }
+    return null;
+  } catch (error) {
+    console.error('[Server] Error normalizing phone number:', phoneNumber, error);
+    return null;
+  }
 }
 
 async function getUserByToken(token: string): Promise<UserProfile | null> {
@@ -115,17 +151,26 @@ fastify.post('/auth/request-otp', async (request, reply) => {
       return reply.status(400).send({ success: false, error: 'Invalid phone number' });
     }
 
+    // Normalize phone number to E.164 format
+    const normalizedPhone = normalizePhoneNumber(phoneNumber);
+    if (!normalizedPhone) {
+      return reply.status(400).send({ success: false, error: 'Invalid phone number format' });
+    }
+
+    console.log(`[Server] Phone number normalized: ${phoneNumber} -> ${normalizedPhone}`);
+
     // Generate 6-digit OTP code
     const code = generateOTP();
     const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes from now
 
     // Store OTP in Redis with TTL of 5 minutes (300 seconds)
-    const otpKey = `otp:${phoneNumber}`;
+    // Use normalized phone number as key
+    const otpKey = `otp:${normalizedPhone}`;
     const otpData: OTPData = { code, expiresAt };
     await redis.setex(otpKey, 300, JSON.stringify(otpData));
 
     // Log the code to console (Mock SMS)
-    console.log(`[Server] OTP for ${phoneNumber}: ${code}`);
+    console.log(`[Server] OTP for ${normalizedPhone}: ${code}`);
 
     return { success: true };
   } catch (error) {
@@ -159,8 +204,16 @@ fastify.post('/auth/verify-otp', async (request, reply) => {
       return reply.status(400).send({ success: false, error: 'Invalid public key' });
     }
 
-    // Retrieve OTP from Redis
-    const otpKey = `otp:${phoneNumber}`;
+    // Normalize phone number to E.164 format
+    const normalizedPhone = normalizePhoneNumber(phoneNumber);
+    if (!normalizedPhone) {
+      return reply.status(400).send({ success: false, error: 'Invalid phone number format' });
+    }
+
+    console.log(`[Server] Phone number normalized: ${phoneNumber} -> ${normalizedPhone}`);
+
+    // Retrieve OTP from Redis (use normalized phone number)
+    const otpKey = `otp:${normalizedPhone}`;
     const otpDataStr = await redis.get(otpKey);
 
     if (!otpDataStr) {
@@ -183,31 +236,57 @@ fastify.post('/auth/verify-otp', async (request, reply) => {
     // Delete OTP after successful verification
     await redis.del(otpKey);
 
-    // Get or create user
-    const userKey = `user:${phoneNumber}`;
-    const existingUserStr = await redis.get(userKey);
+    // Get or create user (use normalized phone number)
+    let userKey = `user:${normalizedPhone}`;
+    let existingUserStr = await redis.get(userKey);
+    
+    // Migration: If user not found with normalized key, check if they exist with non-normalized key
+    // This handles existing users who registered before normalization was added
+    if (!existingUserStr && phoneNumber !== normalizedPhone) {
+      const oldUserKey = `user:${phoneNumber}`;
+      const oldUserStr = await redis.get(oldUserKey);
+      if (oldUserStr) {
+        console.log(`[Server] Migrating user from non-normalized key: ${phoneNumber} -> ${normalizedPhone}`);
+        // Migrate: delete old key, create with normalized key
+        const oldUser: UserProfile = JSON.parse(oldUserStr);
+        await redis.del(oldUserKey);
+        // Update phone number to normalized format
+        const migratedUser: UserProfile = {
+          ...oldUser,
+          phoneNumber: normalizedPhone,
+          publicKey,
+          pushToken: pushToken || null,
+        };
+        await redis.set(userKey, JSON.stringify(migratedUser));
+        existingUserStr = JSON.stringify(migratedUser);
+        console.log(`[Server] User migrated successfully: ${normalizedPhone} (userId: ${oldUser.id})`);
+      }
+    }
     
     let userId: string;
     if (existingUserStr) {
       const existingUser: UserProfile = JSON.parse(existingUserStr);
       userId = existingUser.id;
-      // Update user profile
+      // Update user profile (ensure phone number is normalized)
       const updatedUser: UserProfile = {
         ...existingUser,
+        phoneNumber: normalizedPhone, // Ensure normalized format
         publicKey,
         pushToken: pushToken || null,
       };
       await redis.set(userKey, JSON.stringify(updatedUser));
+      console.log(`[Server] Updated existing user: ${normalizedPhone} (userId: ${userId})`);
     } else {
       // Create new user
       userId = `user_${Date.now()}_${Math.random().toString(36).substring(7)}`;
       const newUser: UserProfile = {
         id: userId,
-        phoneNumber,
+        phoneNumber: normalizedPhone, // Store normalized phone number
         publicKey,
         pushToken: pushToken || null,
       };
       await redis.set(userKey, JSON.stringify(newUser));
+      console.log(`[Server] Created new user: ${normalizedPhone} (userId: ${userId})`);
     }
 
     // Generate session token
@@ -239,6 +318,8 @@ fastify.post('/contacts/sync', async (request, reply) => {
 
     const foundUsers: Array<{ phoneNumber: string; publicKey: string; userId: string }> = [];
 
+    console.log(`[Server] Contact sync: Checking ${phoneNumbers.length} phone numbers`);
+
     // Loop through each phone number and check if user exists in Redis
     for (const phoneNumber of phoneNumbers) {
       const userKey = `user:${phoneNumber}`;
@@ -253,13 +334,17 @@ fastify.post('/contacts/sync', async (request, reply) => {
             publicKey: user.publicKey,
             userId: user.id,
           });
+          console.log(`[Server] Found user: ${user.phoneNumber} (userId: ${user.id})`);
         } catch (parseError) {
           // Skip invalid JSON entries
           console.error(`[Server] Error parsing user data for ${phoneNumber}:`, parseError);
         }
+      } else {
+        console.log(`[Server] User not found for phone number: ${phoneNumber}`);
       }
     }
 
+    console.log(`[Server] Contact sync: Found ${foundUsers.length} users out of ${phoneNumbers.length} phone numbers`);
     return { success: true, users: foundUsers };
   } catch (error) {
     console.error('[Server] Error syncing contacts:', error);
