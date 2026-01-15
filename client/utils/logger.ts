@@ -1,4 +1,4 @@
-import { logger as createLogger } from 'react-native-logs';
+import { logger, consoleTransport } from 'react-native-logs';
 
 /**
  * Logger configuration for the Purple Box app
@@ -8,7 +8,7 @@ import { logger as createLogger } from 'react-native-logs';
 const config = {
   // In production, keep only warn/error to reduce noise and avoid sensitive logging.
   severity: __DEV__ ? 'debug' : 'warn',
-  transport: console,
+  transport: consoleTransport,
   transportOptions: {
     colors: {
       info: 'blueBright',
@@ -24,20 +24,20 @@ const config = {
   enabled: true,
 };
 
-export const logger = createLogger(config);
+export const loggerInstance = logger.createLogger(config);
 
 /**
  * Convenience methods for common log levels
  */
 export const log = {
-  debug: (message: string, ...args: any[]) => logger.debug(message, ...args),
-  info: (message: string, ...args: any[]) => logger.info(message, ...args),
-  warn: (message: string, ...args: any[]) => logger.warn(message, ...args),
+  debug: (message: string, ...args: any[]) => loggerInstance.debug(message, ...args),
+  info: (message: string, ...args: any[]) => loggerInstance.info(message, ...args),
+  warn: (message: string, ...args: any[]) => loggerInstance.warn(message, ...args),
   error: (message: string, error?: Error | unknown, ...args: any[]) => {
     if (error instanceof Error) {
-      logger.error(message, error.message, error.stack, ...args);
+      loggerInstance.error(message, error.message, error.stack, ...args);
     } else {
-      logger.error(message, error, ...args);
+      loggerInstance.error(message, error, ...args);
     }
   },
 };

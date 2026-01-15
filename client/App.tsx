@@ -3,7 +3,7 @@
 import 'react-native-get-random-values';
 
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { AppState, AppStateStatus, View, ActivityIndicator, StyleSheet } from 'react-native';
+import { AppState, AppStateStatus, View, ActivityIndicator, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Notifications from 'expo-notifications';
 import { NavigationContainer, DarkTheme } from '@react-navigation/native';
@@ -40,6 +40,7 @@ export default function App() {
   const navigationRef = useRef<NavigationContainerRef<RootStackParamList>>(null);
   const { wipe, checkLogin, isAuthenticated, checkInbox } = useStore();
   const [isLoading, setIsLoading] = useState(true);
+  const [hasError, setHasError] = useState<string | null>(null);
   const [stableAuthState, setStableAuthState] = useState<boolean>(isAuthenticated);
   const authTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isInitialMount = useRef(true);
@@ -47,9 +48,17 @@ export default function App() {
   // Check login status on app launch
   useEffect(() => {
     const init = async () => {
-      setIsLoading(true);
-      await checkLogin();
-      setIsLoading(false);
+      try {
+        setIsLoading(true);
+        setHasError(null);
+        await checkLogin();
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        log.error('[App] Error during initialization:', error);
+        setHasError(errorMessage);
+      } finally {
+        setIsLoading(false);
+      }
     };
     init();
   }, []);
@@ -167,6 +176,26 @@ export default function App() {
     };
   }, [wipe, checkLogin]);
 
+  // Show error screen if initialization failed
+  if (hasError) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={{ color: '#FFFFFF', marginBottom: 20 }}>Error: {hasError}</Text>
+        <TouchableOpacity
+          style={{ backgroundColor: '#8A2BE2', padding: 12, borderRadius: 8 }}
+          onPress={() => {
+            setHasError(null);
+            setIsLoading(true);
+            checkLogin().finally(() => setIsLoading(false));
+          }}
+        >
+          <Text style={{ color: '#FFFFFF' }}>Retry</Text>
+        </TouchableOpacity>
+        <StatusBar style="light" />
+      </View>
+    );
+  }
+
   // Show loading screen while checking login
   if (isLoading) {
     return (
@@ -176,6 +205,13 @@ export default function App() {
       </View>
     );
   }
+
+  // Debug: Log current state
+  log.debug('[App] Rendering with state:', { 
+    isLoading, 
+    isAuthenticated, 
+    stableAuthState 
+  });
 
   return (
     <NavigationContainer ref={navigationRef} theme={DarkTheme}>
