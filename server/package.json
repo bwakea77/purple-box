@@ -23,6 +23,7 @@
     "fastify": "^4.29.1",
     "fastify-socket.io": "^5.1.0",
     "ioredis": "^5.9.1",
+    "libphonenumber-js": "^1.11.14",
     "redis": "^5.10.0",
     "socket.io": "^4.8.3",
     "ts-node": "^10.9.2",
