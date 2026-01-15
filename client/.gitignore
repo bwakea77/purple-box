@@ -36,6 +36,10 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
+# Native projects
+# NOTE: This repo tracks `android/` because we need to commit native fixes (e.g. DevLauncher crashes).
+# Keep build artifacts ignored via `android/.gitignore`.
+#
+# If you switch back to fully managed Expo and want generated native folders ignored, uncomment:
+# /ios
+# /android
