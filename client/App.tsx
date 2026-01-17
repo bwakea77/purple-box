@@ -38,7 +38,7 @@ const AppStack = createNativeStackNavigator<AppStackParamList>();
 export default function App() {
   const appState = useRef(AppState.currentState);
   const navigationRef = useRef<NavigationContainerRef<RootStackParamList>>(null);
-  const { wipe, checkLogin, isAuthenticated, checkInbox } = useStore();
+  const { wipe, checkLogin, isAuthenticated } = useStore();
   const [isLoading, setIsLoading] = useState(true);
   const [hasError, setHasError] = useState<string | null>(null);
   const [stableAuthState, setStableAuthState] = useState<boolean>(isAuthenticated);
@@ -119,16 +119,13 @@ export default function App() {
         navigationRef.current?.navigate('Home');
       }
 
-      // Refresh inbox to ensure new message is visible
-      checkInbox().catch((error) => {
-        log.error('[App] error checking inbox after notification', error);
-      });
+      // Inbox will be populated when user enters a chat (via enter_chat)
     });
 
     return () => {
       subscription.remove();
     };
-  }, [checkInbox]);
+  }, []);
 
   // Set up AppState listener to wipe data when app goes to background
   // This is critical for security - ensures data is wiped from RAM immediately

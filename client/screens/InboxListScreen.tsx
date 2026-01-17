@@ -21,23 +21,7 @@ interface Props {
 export default function InboxListScreen({ navigation }: Props) {
   usePreventScreenCapture();
 
-  const { inbox, checkInbox } = useStore();
-  const [loading, setLoading] = React.useState(false);
-
-  React.useEffect(() => {
-    const loadInbox = async () => {
-      try {
-        setLoading(true);
-        await checkInbox();
-      } catch (error) {
-        log.error('[InboxList] error checking inbox', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    loadInbox();
-  }, []);
+  const { inbox } = useStore();
 
   const handleSenderPress = (sender: string) => {
     navigation.navigate('Chat', { targetUser: sender });
@@ -50,12 +34,7 @@ export default function InboxListScreen({ navigation }: Props) {
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Inbox</Text>
       </View>
-      {loading ? (
-        <View style={styles.loadingContainer}>
-          <Text style={styles.loadingText}>Loading...</Text>
-        </View>
-      ) : (
-        <FlatList
+      <FlatList
           data={senders}
           keyExtractor={(item) => item}
           renderItem={({ item }) => {
@@ -87,7 +66,6 @@ export default function InboxListScreen({ navigation }: Props) {
             </View>
           }
         />
-      )}
     </View>
   );
 }

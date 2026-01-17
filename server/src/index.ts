@@ -654,12 +654,12 @@ fastify.ready(async () => {
         await redis.del(bufferKey);
 
         // Parse and return messages in order
-        const messages = bufferedMessagesStr.map((msgStr) => {
+        const messages = bufferedMessagesStr.map((msgStr: string) => {
           return JSON.parse(msgStr) as { messageId: string; cipherText: string; seq: number };
         });
 
         // Sort by sequence number
-        messages.sort((a, b) => a.seq - b.seq);
+        messages.sort((a: { messageId: string; cipherText: string; seq: number }, b: { messageId: string; cipherText: string; seq: number }) => a.seq - b.seq);
 
         if (callback) {
           callback({ success: true, messages });
@@ -694,46 +694,6 @@ fastify.ready(async () => {
         console.log(`[Server] User ${userId} left chat`);
       } catch (error) {
         console.error('[Server] Error leaving chat:', error instanceof Error ? error.message : 'Unknown error');
-      }
-    });
-
-    // Legacy fetch_inbox: Keep for backwards compatibility (deprecated)
-    socket.on('fetch_inbox', async (userId: string, callback: (response: { success: boolean; messages?: Array<{ encryptedMessage: string; order: number }>; error?: string }) => void) => {
-      try {
-        if (!userId || typeof userId !== 'string') {
-          callback({ success: false, error: 'Invalid user ID' });
-          return;
-        }
-
-        const redisKey = `inbox:${userId}`;
-        
-        // Retrieve all messages from Redis list (LRANGE 0 -1 gets all items)
-        const encryptedMessages = await redis.lrange(redisKey, 0, -1);
-
-        if (!encryptedMessages || encryptedMessages.length === 0) {
-          callback({ success: true, messages: [] });
-          return;
-        }
-
-        // Immediately delete the inbox key (prevent re-reading)
-        await redis.del(redisKey);
-
-        // Legacy ordering - use conversation sequence if available, else use user counter
-        // This is for backwards compatibility only
-        const messagesWithOrder = encryptedMessages.map((encryptedMessage, index) => {
-          return { encryptedMessage, order: index };
-        });
-
-        // Return array of messages with ordering tokens
-        callback({ success: true, messages: messagesWithOrder });
-
-        console.log(`[Server] Legacy inbox retrieved for user: ${userId} (${encryptedMessages.length} messages)`);
-      } catch (error) {
-        console.error('[Server] Error fetching inbox:', error instanceof Error ? error.message : 'Unknown error');
-        callback({
-          success: false,
-          error: error instanceof Error ? error.message : 'Failed to retrieve inbox',
-        });
       }
     });
 

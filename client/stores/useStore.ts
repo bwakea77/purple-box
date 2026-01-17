@@ -61,7 +61,6 @@ interface StoreState {
   fetchContacts: () => Promise<void>;
   syncContacts: () => Promise<void>;
   sendMessage: (to: string, text: string) => Promise<void>;
-  checkInbox: () => Promise<void>;
   enterChat: (conversationId: string) => Promise<void>;
   leaveChat: (conversationId: string) => Promise<void>;
   exitSession: (userId: string) => void;
@@ -247,15 +246,11 @@ export const useStore = create<StoreState>((set, get) => ({
         }, 100);
       });
 
-      // Listen for box_status updates - automatically fetch messages when box is full
+      // Listen for box_status updates (legacy event - just set hasUnread flag)
       socket.on('box_status', (status: string) => {
         if (status === 'FULL') {
           set({ hasUnread: true });
-          log.debug('[Store] Box status: FULL - fetching messages');
-          // Automatically fetch messages when box status is FULL
-          get().checkInbox().catch((error) => {
-            log.error('[Store] Error fetching inbox on box_status FULL', error);
-          });
+          log.debug('[Store] Box status: FULL - messages waiting');
         }
       });
 
@@ -952,163 +947,6 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
-  /**
-   * Check inbox: Emit 'fetch_inbox', decrypt all messages, group by sender, set hasUnread
-   */
-  checkInbox: async () => {
-    const state = get();
-
-    // If store is not initialized, try to initialize (regardless of auth state)
-    if (!state.socket || !state.keys || !state.userId) {
-      log.debug('[Store] Store not initialized, attempting to connect socket', {
-        hasSocket: !!state.socket,
-        hasKeys: !!state.keys,
-        hasUserId: !!state.userId,
-        isAuthenticated: state.isAuthenticated,
-      });
-      try {
-        await get().connectSocket();
-        // Re-get state after connecting
-        const newState = get();
-        if (!newState.socket || !newState.keys || !newState.userId) {
-          log.error('[Store] Store still not initialized after connectSocket', {
-            hasSocket: !!newState.socket,
-            hasKeys: !!newState.keys,
-            hasUserId: !!newState.userId,
-          });
-          throw new Error('Store not initialized after connection attempt');
-        }
-        log.debug('[Store] Store successfully initialized');
-      } catch (error) {
-        log.error('[Store] Failed to initialize store for checkInbox:', error);
-        throw new Error(`Store not initialized: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      }
-    }
-
-    // Re-check initialization after potential reconnection
-    const currentState = get();
-    if (!currentState.socket || !currentState.keys || !currentState.userId) {
-      log.error('[Store] Store validation failed', {
-        hasSocket: !!currentState.socket,
-        hasKeys: !!currentState.keys,
-        hasUserId: !!currentState.userId,
-      });
-      throw new Error('Store not initialized');
-    }
-
-    if (!currentState.socket.connected) {
-      throw new Error('Socket not connected');
-    }
-
-    try {
-      const messagesWithOrder = await new Promise<Array<{ encryptedMessage: string; order: number }>>((resolve, reject) => {
-        if (!currentState.socket) {
-          reject(new Error('Socket not available'));
-          return;
-        }
-
-        currentState.socket.emit('fetch_inbox', currentState.userId, (response: {
-          success: boolean;
-          messages?: Array<{ encryptedMessage: string; order: number }>;
-          error?: string;
-        }) => {
-          if (!response.success) {
-            reject(new Error(response.error || 'Failed to fetch inbox'));
-            return;
-          }
-
-          resolve(response.messages || []);
-        });
-      });
-
-      // Decrypt all messages and assign order values from server
-      const decryptedPayloads: SignedPayload[] = [];
-      for (const { encryptedMessage, order } of messagesWithOrder) {
-        try {
-          const decrypted = decrypt(encryptedMessage, currentState.keys!.secretKey);
-          if (decrypted) {
-            const payload: SignedPayload = JSON.parse(decrypted);
-            // Assign server order token (ephemeral, persists across inbox fetches within session)
-            payload.order = order;
-            payload.optimistic = false; // Server-confirmed messages are not optimistic
-            decryptedPayloads.push(payload);
-          }
-        } catch (error) {
-          log.error('[Store] failed to decrypt message payload', error);
-          // Continue with other messages
-        }
-      }
-
-      // INBOX MERGE LOGIC: Merge messages by id, preserve existing order values, re-sort using compareMessages
-      // EPHEMERAL ORDERING: Messages from previous checkInbox() calls retain their order values
-      // Order values are never removed or recomputed once assigned
-      const groupedInbox: Record<string, SignedPayload[]> = { ...currentState.inbox };
-      
-      // Group decrypted messages by sender
-      const serverMessagesBySender: Record<string, SignedPayload[]> = {};
-      for (const payload of decryptedPayloads) {
-        const sender = payload.sender;
-        if (!serverMessagesBySender[sender]) {
-          serverMessagesBySender[sender] = [];
-        }
-        serverMessagesBySender[sender].push(payload);
-      }
-      
-      // Merge server messages with existing messages for each sender
-      // CRITICAL: Merge by message key (id), preserve existing order values, assign order only from server
-      for (const sender in serverMessagesBySender) {
-        const existingMessages = groupedInbox[sender] || [];
-        const serverMessages = serverMessagesBySender[sender];
-        
-        // Create a map of existing messages by key for efficient lookup
-        const existingMap = new Map<string, SignedPayload>();
-        existingMessages.forEach(msg => {
-          existingMap.set(getMessageKey(msg), msg);
-        });
-        
-        // Merge: Replace existing messages by key, preserve order if message already exists
-        // Assign order from server for new messages
-        serverMessages.forEach(serverMsg => {
-          const key = getMessageKey(serverMsg);
-          const existing = existingMap.get(key);
-          if (existing) {
-            // Message already exists - preserve its existing order value (never overwrite non-null order)
-            // Only update if order is null/undefined
-            if (existing.order == null && serverMsg.order != null) {
-              existing.order = serverMsg.order;
-              existing.optimistic = false;
-            }
-          } else {
-            // New message - add with server order
-            existingMap.set(key, serverMsg);
-          }
-        });
-        
-        // Convert back to array and sort using compareMessages (single source of truth)
-        groupedInbox[sender] = Array.from(existingMap.values()).sort(compareMessages);
-      }
-      
-      // Also sort existing senders that didn't get new messages (for consistency)
-      for (const sender in groupedInbox) {
-        if (!serverMessagesBySender[sender]) {
-          groupedInbox[sender] = [...groupedInbox[sender]].sort(compareMessages);
-        }
-      }
-
-      // Set hasUnread to true if messages exist
-      const hasUnread = decryptedPayloads.length > 0;
-
-      set({
-        inbox: groupedInbox,
-        hasUnread,
-      });
-
-      log.info('[Store] inbox checked', { messages: decryptedPayloads.length, senders: Object.keys(groupedInbox).length });
-    } catch (error) {
-      log.error('[Store] error checking inbox', error);
-      throw error;
-    }
-  },
 
   /**
    * Enter chat: Emit enter_chat, flush buffer, update messages
