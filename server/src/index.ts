@@ -497,6 +497,9 @@ fastify.ready(async () => {
         const recipientPresence = getUserPresence(to);
         const seq = getNextSequenceNumber(conversationId);
 
+        // Emit message_sent acknowledgment immediately after validation for instant feedback
+        socket.emit('message_sent', { messageId: payload.messageId, timestamp: Date.now() });
+
         // Decision-based delivery
         // 1. If recipient presence is IN_CHAT (and conversation IDs match): deliver directly via socket
         if (typeof recipientPresence === 'object' && recipientPresence.type === 'IN_CHAT' && recipientPresence.conversationId === conversationId) {
@@ -520,9 +523,6 @@ fastify.ready(async () => {
           
           // Refresh expiration to MESSAGE_TTL on every push
           await redis.expire(bufferKey, MESSAGE_TTL);
-          
-          // Emit the message_sent ack to the sender
-          socket.emit('message_sent', { messageId: payload.messageId, timestamp: Date.now() });
 
           // Handle notification based on presence state
           if (recipientPresence === 'ONLINE_IDLE') {
