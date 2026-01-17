@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform, ActivityIndicator } from 'react-native';
 import { usePreventScreenCapture } from 'expo-screen-capture';
 import { useFocusEffect } from '@react-navigation/native';
 import { useStore, type SignedPayload } from '../stores/useStore';
@@ -26,12 +26,37 @@ export default function ChatScreen({ navigation, route }: Props) {
   usePreventScreenCapture();
 
   const { targetUser } = route.params;
-  const { inbox, sendMessage, exitSession, userId } = useStore();
+  // Subscribe to inbox changes - selector ensures reactivity
+  const inbox = useStore((state) => state.inbox);
+  const sendMessage = useStore((state) => state.sendMessage);
+  const exitSession = useStore((state) => state.exitSession);
+  const enterChat = useStore((state) => state.enterChat);
+  const leaveChat = useStore((state) => state.leaveChat);
+  const userId = useStore((state) => state.userId);
+  
+  // Get messages for this user - will update when inbox changes
+  const messages = inbox[targetUser] || [];
   const [messageText, setMessageText] = useState('');
   const [sending, setSending] = useState(false);
   const flatListRef = useRef<FlatList>(null);
+  const conversationIdRef = useRef<string | null>(null);
 
-  const messages = inbox[targetUser] || [];
+  // Generate conversation ID (simple hash - no native module required)
+  useEffect(() => {
+    if (!userId || !targetUser) return;
+    // Simple hash function for conversation ID
+    const simpleHash = (str: string): string => {
+      let hash = 5381;
+      for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) + hash) + str.charCodeAt(i);
+        hash = hash & hash; // Convert to 32-bit integer
+      }
+      return Math.abs(hash).toString(16).padStart(8, '0');
+    };
+    const [s1, s2] = userId < targetUser ? [userId, targetUser] : [targetUser, userId];
+    const combined = `${s1}|${s2}`;
+    conversationIdRef.current = simpleHash(combined);
+  }, [userId, targetUser]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -40,25 +65,39 @@ export default function ChatScreen({ navigation, route }: Props) {
         flatListRef.current?.scrollToEnd({ animated: true });
       }, 100);
     }
-  }, [messages.length]);
+  }, [messages]);
 
-  // CRITICAL: Exit session on blur (useFocusEffect) or unmount
+  // Enter chat when screen focuses and leave chat on blur
   useFocusEffect(
     React.useCallback(() => {
-      // On focus: do nothing (keep session active)
+      // On focus: enter chat to flush buffer and get buffered messages
+      if (conversationIdRef.current) {
+        enterChat(conversationIdRef.current).catch((error) => {
+          log.error('[ChatScreen] error entering chat', error);
+        });
+      }
+      
       return () => {
-        // On blur: exit session to wipe data
+        // On blur: leave chat and exit session to wipe data
+        if (conversationIdRef.current) {
+          leaveChat(conversationIdRef.current).catch((error) => {
+            log.error('[ChatScreen] error leaving chat', error);
+          });
+        }
         exitSession(targetUser);
       };
-    }, [targetUser, exitSession])
+    }, [targetUser, exitSession, enterChat, leaveChat])
   );
 
   // Also handle unmount
   useEffect(() => {
     return () => {
+      if (conversationIdRef.current) {
+        leaveChat(conversationIdRef.current).catch(() => {});
+      }
       exitSession(targetUser);
     };
-  }, [targetUser, exitSession]);
+  }, [targetUser, exitSession, leaveChat]);
 
   const handleSend = async () => {
     if (!messageText.trim() || sending) {
@@ -80,6 +119,30 @@ export default function ChatScreen({ navigation, route }: Props) {
     const isMe = item.sender === userId;
     const time = new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+    const renderStatusIndicator = () => {
+      if (!isMe || !item.status) return null;
+
+      switch (item.status) {
+        case 'pending':
+          return (
+            <ActivityIndicator 
+              size="small" 
+              color="#8B5CF6"
+            />
+          );
+        case 'sent':
+          return (
+            <Text style={styles.statusCheckmark}>✓</Text>
+          );
+        case 'delivered':
+          return (
+            <Text style={styles.statusCheckmark}>✓✓</Text>
+          );
+        default:
+          return null;
+      }
+    };
+
     return (
       <View
         style={[
@@ -96,9 +159,12 @@ export default function ChatScreen({ navigation, route }: Props) {
           <Text style={[styles.messageText, isMe && styles.messageTextRight]}>
             {item.message}
           </Text>
-          <Text style={[styles.messageTime, isMe && styles.messageTimeRight]}>
-            {time}
-          </Text>
+          <View style={styles.messageTimeContainer}>
+            <Text style={[styles.messageTime, isMe && styles.messageTimeRight]}>
+              {time}
+            </Text>
+            {renderStatusIndicator()}
+          </View>
         </View>
       </View>
     );
@@ -126,6 +192,7 @@ export default function ChatScreen({ navigation, route }: Props) {
       <FlatList
         ref={flatListRef}
         data={messages}
+        extraData={messages.length}
         keyExtractor={(item, index) => `${item.timestamp}-${index}`}
         renderItem={renderMessage}
         contentContainerStyle={styles.messagesList}
@@ -224,13 +291,22 @@ const styles = StyleSheet.create({
   messageTextRight: {
     color: '#FFFFFF',
   },
+  messageTimeContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-end',
+    gap: 4,
+  },
   messageTime: {
     fontSize: 12,
     color: '#B0B0B0',
-    alignSelf: 'flex-end',
   },
   messageTimeRight: {
     color: '#E5E7EB',
+  },
+  statusCheckmark: {
+    fontSize: 12,
+    color: '#8B5CF6',
   },
   emptyContainer: {
     flex: 1,

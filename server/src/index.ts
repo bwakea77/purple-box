@@ -10,6 +10,9 @@ import { parsePhoneNumber } from 'libphonenumber-js';
 // Initialize Expo push notification service
 const expo = new Expo();
 
+// Message buffer TTL: 14 days (1209600 seconds) for asynchronous messaging
+const MESSAGE_TTL = 1209600;
+
 // Data models
 interface UserProfile {
   id: string;
@@ -23,15 +26,33 @@ interface OTPData {
   expiresAt: number;
 }
 
+// Presence states (server-tracked)
+type PresenceState = 'OFFLINE' | 'ONLINE_IDLE' | { type: 'IN_CHAT'; conversationId: string };
+
 // In-memory user socket mapping (zero persistence)
-// Maps userId to { socketId, publicKey, pushToken }
+// Maps userId to { socketId, publicKey, pushToken, presence }
 interface UserSocketInfo {
   socketId: string;
   publicKey: string;
   pushToken: string | null;
   userId: string;
+  presence: PresenceState;
 }
 const userSockets: Record<string, UserSocketInfo> = {};
+
+// Conversation sequence counters (per conversation, in-memory only)
+// Maps conversationId to the next sequence number
+const conversationSequenceCounters: Record<string, number> = {};
+
+// Ephemeral message buffer (replaces inbox)
+// Key: conversationId, Value: Array of { messageId, cipherText, seq }
+// TTL: 14 days (1209600 seconds), no size limit - grows until delivered
+interface BufferedMessage {
+  messageId: string;
+  cipherText: string;
+  seq: number;
+}
+const messageBuffers: Record<string, BufferedMessage[]> = {};
 
 // Helper functions
 function generateOTP(): string {
@@ -41,6 +62,53 @@ function generateOTP(): string {
 function generateSessionToken(userId: string): string {
   // Simple token: just userId for MVP
   return userId;
+}
+
+/**
+ * Simple hash function for generating conversation IDs (deterministic)
+ * Uses djb2 algorithm - matches client implementation
+ */
+function simpleHash(str: string): string {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  // Convert to positive hex string (matches client)
+  return Math.abs(hash).toString(16).padStart(8, '0');
+}
+
+/**
+ * Generate conversation ID by hashing two user IDs
+ * Always produces the same ID for the same two users (order-independent)
+ * Uses simple hash to match client implementation (no native modules required)
+ */
+function generateConversationId(userA: string, userB: string): string {
+  // Sort to ensure consistent ordering
+  const [s1, s2] = userA < userB ? [userA, userB] : [userB, userA];
+  const combined = `${s1}|${s2}`;
+  return simpleHash(combined);
+}
+
+/**
+ * Get next sequence number for a conversation
+ */
+function getNextSequenceNumber(conversationId: string): number {
+  if (!conversationSequenceCounters[conversationId]) {
+    conversationSequenceCounters[conversationId] = 0;
+  }
+  return conversationSequenceCounters[conversationId]++;
+}
+
+/**
+ * Get presence state for a user
+ */
+function getUserPresence(userId: string): PresenceState {
+  const userInfo = userSockets[userId];
+  if (!userInfo) {
+    return 'OFFLINE';
+  }
+  return userInfo.presence;
 }
 
 /**
@@ -386,18 +454,19 @@ fastify.ready(async () => {
           return;
         }
 
-        // Map userId to socket info (socketId, publicKey, pushToken, and userId)
+        // Map userId to socket info (socketId, publicKey, pushToken, userId, and presence)
         userSockets[user.id] = {
           socketId: socket.id,
           publicKey: user.publicKey,
           pushToken: user.pushToken,
           userId: user.id,
+          presence: 'ONLINE_IDLE', // Initial presence state
         };
         
         // Join room with userId
         socket.join(user.id);
         
-        console.log(`[Server] User identified: ${user.id} (phone: ${user.phoneNumber}, socket: ${socket.id}, pushToken: ${user.pushToken ? 'present' : 'none'})`);
+        console.log(`[Server] User identified: ${user.id} (phone: ${user.phoneNumber}, socket: ${socket.id}, pushToken: ${user.pushToken ? 'present' : 'none'}, presence: ONLINE_IDLE)`);
       } catch (error) {
         console.error('[Server] Error in identify:', error instanceof Error ? error.message : 'Unknown error');
         socket.emit('error', {
@@ -406,52 +475,88 @@ fastify.ready(async () => {
       }
     });
 
-    // Send message: Append cipherText to Redis list with 60s TTL
-    socket.on('send_message', async (payload: { to: string; cipherText: string }) => {
+    // Send message: New logic based on recipient presence
+    socket.on('send_message', async (payload: { conversationId: string; messageId: string; cipherText: string; to: string }) => {
       try {
-        const { to, cipherText } = payload;
+        const { conversationId, messageId, cipherText, to } = payload;
 
-        if (!to || !cipherText) {
-          socket.emit('error', { message: 'Missing required fields: to, cipherText' });
+        if (!conversationId || !messageId || !cipherText || !to) {
+          socket.emit('error', { message: 'Missing required fields: conversationId, messageId, cipherText, to' });
           return;
         }
 
-        // Store message in Redis list with key format: inbox:{userId}
-        // Use RPUSH to append to the list
-        const redisKey = `inbox:${to}`;
-        await redis.rpush(redisKey, cipherText);
-        
-        // CRITICAL: Refresh expiration to exactly 60 seconds on each push
-        await redis.expire(redisKey, 60);
-
-        // Emit box_status: 'FULL' to recipient's room
-        io.to(to).emit('box_status', 'FULL');
-
-        // Send push notification if recipient has a push token
-        const recipientInfo = userSockets[to];
-        if (recipientInfo && recipientInfo.pushToken) {
-          try {
-            // Validate push token format
-            if (Expo.isExpoPushToken(recipientInfo.pushToken)) {
-              await expo.sendPushNotificationsAsync([
-                {
-                  to: recipientInfo.pushToken,
-                  sound: 'default',
-                  title: 'Purple Box',
-                  body: 'The box is full. Empty it.',
-                  data: { boxStatus: 'FULL' },
-                },
-              ]);
-              console.log(`[Server] Push notification sent to: ${to}`);
-            } else {
-              console.log(`[Server] Invalid push token format for user: ${to}`);
-            }
-          } catch (error) {
-            console.error(`[Server] Error sending push notification to ${to}:`, error instanceof Error ? error.message : 'Unknown error');
-          }
+        // Get sender userId from socket
+        const senderId = Object.keys(userSockets).find(
+          (key) => userSockets[key]?.socketId === socket.id
+        );
+        if (!senderId) {
+          socket.emit('error', { message: 'Sender not identified' });
+          return;
         }
 
-        console.log(`[Server] Message appended to inbox for user: ${to} (expires in 60s)`);
+        const recipientPresence = getUserPresence(to);
+        const seq = getNextSequenceNumber(conversationId);
+
+        // Decision-based delivery
+        // 1. If recipient presence is IN_CHAT (and conversation IDs match): deliver directly via socket
+        if (typeof recipientPresence === 'object' && recipientPresence.type === 'IN_CHAT' && recipientPresence.conversationId === conversationId) {
+          const recipientInfo = userSockets[to];
+          if (recipientInfo) {
+            io.to(recipientInfo.socketId).emit('receive_message', {
+              conversationId,
+              messageId,
+              cipherText,
+              seq,
+            });
+            console.log(`[Server] Message delivered directly via socket to ${to} (IN_CHAT)`);
+          }
+        } else {
+          // 2. If recipient presence is anything else (ONLINE_IDLE or OFFLINE): buffer in Redis
+          const bufferKey = `buffer:${conversationId}`;
+
+          // Store message with sequence number (JSON format)
+          const bufferedMsg = JSON.stringify({ messageId, cipherText, seq });
+          await redis.rpush(bufferKey, bufferedMsg);
+          
+          // Refresh expiration to MESSAGE_TTL on every push
+          await redis.expire(bufferKey, MESSAGE_TTL);
+          
+          // Emit the message_sent ack to the sender
+          socket.emit('message_sent', { messageId: payload.messageId, timestamp: Date.now() });
+
+          // Handle notification based on presence state
+          if (recipientPresence === 'ONLINE_IDLE') {
+            // If they are ONLINE_IDLE, emit conversation_waiting
+            const recipientInfo = userSockets[to];
+            if (recipientInfo) {
+              io.to(recipientInfo.socketId).emit('conversation_waiting', { conversationId });
+              console.log(`[Server] conversation_waiting event emitted to ${to} (ONLINE_IDLE)`);
+            }
+          } else if (recipientPresence === 'OFFLINE') {
+            // If they are OFFLINE, send the Push Notification
+            const recipientInfo = userSockets[to];
+            if (recipientInfo && recipientInfo.pushToken) {
+              try {
+                if (Expo.isExpoPushToken(recipientInfo.pushToken)) {
+                  await expo.sendPushNotificationsAsync([
+                    {
+                      to: recipientInfo.pushToken,
+                      sound: 'default',
+                      title: 'Purple Box',
+                      body: 'Someone wants to chat',
+                      data: { conversationId },
+                    },
+                  ]);
+                  console.log(`[Server] Push notification sent to: ${to} (OFFLINE)`);
+                }
+              } catch (error) {
+                console.error(`[Server] Error sending push notification to ${to}:`, error instanceof Error ? error.message : 'Unknown error');
+              }
+            }
+          }
+
+          console.log(`[Server] Message buffered for conversation ${conversationId} (recipient: ${recipientPresence})`);
+        }
       } catch (error) {
         console.error('[Server] Error sending message:', error instanceof Error ? error.message : 'Unknown error');
         socket.emit('error', {
@@ -518,8 +623,82 @@ fastify.ready(async () => {
       }
     });
 
-    // Fetch inbox: Retrieve all messages from Redis list, then delete the key
-    socket.on('fetch_inbox', async (userId: string, callback: (response: { success: boolean; messages?: string[]; error?: string }) => void) => {
+    // Enter chat: Update presence to IN_CHAT, flush buffer for conversation
+    socket.on('enter_chat', async (payload: { conversationId: string }, callback?: (response: { success: boolean; messages?: Array<{ messageId: string; cipherText: string; seq: number }>; error?: string }) => void) => {
+      try {
+        const { conversationId } = payload;
+        if (!conversationId || typeof conversationId !== 'string') {
+          if (callback) callback({ success: false, error: 'Invalid conversation ID' });
+          return;
+        }
+
+        // Get userId from socket
+        const userId = Object.keys(userSockets).find(
+          (key) => userSockets[key]?.socketId === socket.id
+        );
+        if (!userId) {
+          if (callback) callback({ success: false, error: 'User not identified' });
+          return;
+        }
+
+        // Update presence to IN_CHAT
+        if (userSockets[userId]) {
+          userSockets[userId].presence = { type: 'IN_CHAT', conversationId };
+        }
+
+        // Flush buffer for this conversation
+        const bufferKey = `buffer:${conversationId}`;
+        const bufferedMessagesStr = await redis.lrange(bufferKey, 0, -1);
+        
+        // Delete buffer
+        await redis.del(bufferKey);
+
+        // Parse and return messages in order
+        const messages = bufferedMessagesStr.map((msgStr) => {
+          return JSON.parse(msgStr) as { messageId: string; cipherText: string; seq: number };
+        });
+
+        // Sort by sequence number
+        messages.sort((a, b) => a.seq - b.seq);
+
+        if (callback) {
+          callback({ success: true, messages });
+        }
+
+        console.log(`[Server] User ${userId} entered chat ${conversationId}, flushed ${messages.length} buffered messages`);
+      } catch (error) {
+        console.error('[Server] Error entering chat:', error instanceof Error ? error.message : 'Unknown error');
+        if (callback) {
+          callback({
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to enter chat',
+          });
+        }
+      }
+    });
+
+    // Leave chat: Update presence back to ONLINE_IDLE
+    socket.on('leave_chat', async (payload: { conversationId: string }) => {
+      try {
+        // Get userId from socket
+        const userId = Object.keys(userSockets).find(
+          (key) => userSockets[key]?.socketId === socket.id
+        );
+        if (!userId || !userSockets[userId]) {
+          return;
+        }
+
+        // Update presence to ONLINE_IDLE
+        userSockets[userId].presence = 'ONLINE_IDLE';
+
+        console.log(`[Server] User ${userId} left chat`);
+      } catch (error) {
+        console.error('[Server] Error leaving chat:', error instanceof Error ? error.message : 'Unknown error');
+      }
+    });
+
+    // Legacy fetch_inbox: Keep for backwards compatibility (deprecated)
+    socket.on('fetch_inbox', async (userId: string, callback: (response: { success: boolean; messages?: Array<{ encryptedMessage: string; order: number }>; error?: string }) => void) => {
       try {
         if (!userId || typeof userId !== 'string') {
           callback({ success: false, error: 'Invalid user ID' });
@@ -529,9 +708,9 @@ fastify.ready(async () => {
         const redisKey = `inbox:${userId}`;
         
         // Retrieve all messages from Redis list (LRANGE 0 -1 gets all items)
-        const messages = await redis.lrange(redisKey, 0, -1);
+        const encryptedMessages = await redis.lrange(redisKey, 0, -1);
 
-        if (!messages || messages.length === 0) {
+        if (!encryptedMessages || encryptedMessages.length === 0) {
           callback({ success: true, messages: [] });
           return;
         }
@@ -539,10 +718,16 @@ fastify.ready(async () => {
         // Immediately delete the inbox key (prevent re-reading)
         await redis.del(redisKey);
 
-        // Return array of encrypted strings
-        callback({ success: true, messages });
+        // Legacy ordering - use conversation sequence if available, else use user counter
+        // This is for backwards compatibility only
+        const messagesWithOrder = encryptedMessages.map((encryptedMessage, index) => {
+          return { encryptedMessage, order: index };
+        });
 
-        console.log(`[Server] Inbox retrieved and deleted for user: ${userId} (${messages.length} messages)`);
+        // Return array of messages with ordering tokens
+        callback({ success: true, messages: messagesWithOrder });
+
+        console.log(`[Server] Legacy inbox retrieved for user: ${userId} (${encryptedMessages.length} messages)`);
       } catch (error) {
         console.error('[Server] Error fetching inbox:', error instanceof Error ? error.message : 'Unknown error');
         callback({
@@ -552,7 +737,7 @@ fastify.ready(async () => {
       }
     });
 
-    // Disconnect: Clean up userSockets map
+    // Disconnect: Clean up userSockets map and sequence counters
     socket.on('disconnect', () => {
       // Find and remove userId from userSockets map
       const userId = Object.keys(userSockets).find(
@@ -561,7 +746,7 @@ fastify.ready(async () => {
 
       if (userId && userSockets[userId]) {
         delete userSockets[userId];
-        console.log(`[Server] User disconnected: ${userId} (socket: ${socket.id})`);
+        console.log(`[Server] User disconnected: ${userId} (socket: ${socket.id}), presence cleared`);
       } else {
         console.log(`[Server] Client disconnected: ${socket.id}`);
       }

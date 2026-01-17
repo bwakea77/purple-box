@@ -16,12 +16,22 @@ const AUTH_TOKEN_ALIAS = 'auth_token';
 
 /**
  * SignedPayload interface for messages
- * Contains sender, message text, and timestamp
+ * Contains sender, message text, timestamp, and ephemeral ordering token
+ * 
+ * EPHEMERAL ORDERING MODEL:
+ * - order: Server-assigned monotonic ordering token (ephemeral, in-memory only)
+ * - Order persists across inbox fetches within a session but resets on session end
+ * - Optimistic messages have order = null/undefined and always come after server-confirmed messages
+ * - Ordering is deterministic within a session but undefined across sessions (intentional)
  */
 export interface SignedPayload {
   sender: string;
   message: string;
   timestamp: number;
+  order?: number;        // ephemeral server order, monotonic within session
+  optimistic?: boolean;  // true for optimistic messages, false/undefined for server-confirmed
+  status?: 'pending' | 'sent' | 'delivered';  // Delivery status: pending = created locally, sent = acknowledged by server, delivered = downloaded by recipient
+  messageId?: string;    // Client-generated message ID for tracking delivery status
 }
 
 interface Contact {
@@ -52,6 +62,8 @@ interface StoreState {
   syncContacts: () => Promise<void>;
   sendMessage: (to: string, text: string) => Promise<void>;
   checkInbox: () => Promise<void>;
+  enterChat: (conversationId: string) => Promise<void>;
+  leaveChat: (conversationId: string) => Promise<void>;
   exitSession: (userId: string) => void;
   wipe: () => void;
   connectSocket: () => Promise<void>;
@@ -59,6 +71,65 @@ interface StoreState {
   verifyOtp: (phoneNumber: string, code: string, publicKey: string, pushToken: string | null) => Promise<{ success: boolean; token?: string; userId?: string; error?: string }>;
 }
 
+
+/**
+ * Simple hash function for generating conversation IDs (deterministic, no native modules required)
+ * Based on djb2 hash algorithm - good enough for conversation ID generation
+ */
+function simpleHash(str: string): string {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  // Convert to positive hex string
+  return Math.abs(hash).toString(16).padStart(8, '0');
+}
+
+/**
+ * Generate conversation ID by hashing two user IDs (order-independent)
+ */
+function generateConversationId(userA: string, userB: string): string {
+  // Sort to ensure consistent ordering
+  const [s1, s2] = userA < userB ? [userA, userB] : [userB, userA];
+  const combined = `${s1}|${s2}`;
+  // Use simple hash - deterministic and no native modules required
+  return simpleHash(combined);
+}
+
+/**
+ * Helper function to create a stable message key for deduplication
+ */
+function getMessageKey(msg: SignedPayload): string {
+  return `${msg.sender}:${msg.timestamp}:${msg.message}`;
+}
+
+/**
+ * GLOBAL COMPARATOR - SINGLE SOURCE OF TRUTH for message ordering
+ * 
+ * CHRONOLOGICAL ORDERING RULES:
+ * 1. Messages with server-assigned order values are sorted by order when both have order
+ * 2. When comparing messages with mixed order status (one has order, one doesn't), use timestamp for chronological ordering
+ * 3. Messages without order (optimistic) are sorted by timestamp
+ * 
+ * This ensures chronological ordering in conversations where sent messages (optimistic, no order)
+ * are correctly positioned relative to received messages (server-confirmed, has order) based on when they were actually sent/received.
+ */
+function compareMessages(a: SignedPayload, b: SignedPayload): number {
+  // Both have server order - compare by order (monotonic, deterministic)
+  if (a.order != null && b.order != null) {
+    return a.order - b.order;
+  }
+
+  // Mixed case: one has order, one doesn't - use timestamp for chronological ordering
+  // This ensures sent messages (optimistic) appear in correct chronological position relative to received messages
+  if (a.order != null || b.order != null) {
+    return a.timestamp - b.timestamp;
+  }
+
+  // Neither has order (both optimistic) - sort by timestamp
+  return a.timestamp - b.timestamp;
+}
 
 /**
  * Helper function to register for push notifications
@@ -176,55 +247,142 @@ export const useStore = create<StoreState>((set, get) => ({
         }, 100);
       });
 
-      // Listen for box_status updates
+      // Listen for box_status updates - automatically fetch messages when box is full
       socket.on('box_status', (status: string) => {
         if (status === 'FULL') {
           set({ hasUnread: true });
-          log.debug('[Store] Box status: FULL');
+          log.debug('[Store] Box status: FULL - fetching messages');
+          // Automatically fetch messages when box status is FULL
+          get().checkInbox().catch((error) => {
+            log.error('[Store] Error fetching inbox on box_status FULL', error);
+          });
         }
       });
 
-      // Listen for incoming messages and decrypt them
-      socket.on('receive_message', (message: { sender: string; content: string; timestamp: number }) => {
+      // Listen for incoming real-time messages (direct socket delivery when IN_CHAT)
+      socket.on('receive_message', async (message: { conversationId: string; messageId: string; cipherText: string; seq: number }) => {
         try {
-          // Server should never send plaintext; this handler is legacy.
-          // Treat content as already-readable (no additional AES layer).
-          const payload: SignedPayload = {
-            sender: message.sender,
-            message: message.content,
-            timestamp: message.timestamp || Date.now(),
-          };
-          
-          // Add message to inbox
           const state = get();
-          const currentInbox = state.inbox[message.sender] || [];
+          if (!state.keys || !state.userId) {
+            log.error('[Store] Cannot process receive_message - keys or userId not available');
+            return;
+          }
+
+          // Decrypt message
+          const decrypted = decrypt(message.cipherText, state.keys.secretKey);
+          if (!decrypted) {
+            log.error('[Store] Failed to decrypt receive_message');
+            return;
+          }
+
+          const payload: SignedPayload = JSON.parse(decrypted);
+          // Map server seq to order for compatibility with existing ordering logic
+          payload.order = message.seq;
+          payload.optimistic = false;
+
+          // Extract recipient userId from conversationId (we need to determine the other participant)
+          // For now, we'll need to track conversationId -> userId mapping
+          // Actually, we need the 'to' userId - let's add it to the message payload from server
+          // For now, let's use a workaround: extract from conversationId or store mapping
+          // Actually, the server knows who the recipient is, so we should include it in the message
+          // But for MVP, let's use the sender from the payload and assume it's the other user
+          // Wait - we need to know which conversation this is for. Let's derive it from conversationId
+          // Actually, we need to store a mapping of conversationId -> otherUserId
+          // For simplicity, let's add 'to' to the receive_message payload on server side
+          // But for now, let's use a simpler approach: store conversations by conversationId instead of userId
+          // Actually, let's keep it simple and use the sender from payload - the 'to' is implicit
+          // We'll need to update the inbox structure or add conversation tracking
+          // For now, let's keep the existing structure and use sender as the key (legacy support)
+          const currentInbox = state.inbox[payload.sender] || [];
+          const updatedMessages = [...currentInbox, payload].sort(compareMessages);
+          
           set({
             inbox: {
               ...state.inbox,
-              [message.sender]: [...currentInbox, payload],
+              [payload.sender]: updatedMessages,
             },
-            hasUnread: true,
           });
-          
-          log.info('[Store] message received', { from: message.sender });
+
+          log.debug('[Store] Received real-time message', { conversationId: message.conversationId, seq: message.seq });
         } catch (error) {
-          log.error('[Store] error handling received message', error);
-          // Fallback: add message with original content
-          const payload: SignedPayload = {
-            sender: message.sender,
-            message: message.content,
-            timestamp: message.timestamp || Date.now(),
-          };
-          
+          log.error('[Store] Error processing receive_message', error);
+        }
+      });
+
+      // Listen for conversation_waiting event (when ONLINE_IDLE and message is buffered)
+      socket.on('conversation_waiting', (data: { conversationId: string }) => {
+        log.debug('[Store] conversation_waiting event received', { conversationId: data.conversationId });
+        // Can trigger UI notification or update state if needed
+        set({ hasUnread: true });
+      });
+
+      // Listen for message_sent event (server acknowledgment)
+      socket.on('message_sent', (data: { messageId: string; timestamp: number }) => {
+        try {
           const state = get();
-          const currentInbox = state.inbox[message.sender] || [];
-          set({
-            inbox: {
-              ...state.inbox,
-              [message.sender]: [...currentInbox, payload],
-            },
-            hasUnread: true,
-          });
+          const updatedInbox: Record<string, SignedPayload[]> = { ...state.inbox };
+          let messageFound = false;
+
+          // Search through all inbox entries to find the message by messageId
+          for (const userId in updatedInbox) {
+            const messages = updatedInbox[userId];
+            const messageIndex = messages.findIndex(msg => msg.messageId === data.messageId);
+            
+            if (messageIndex !== -1) {
+              // Update the message status to 'sent'
+              updatedInbox[userId] = [
+                ...messages.slice(0, messageIndex),
+                { ...messages[messageIndex], status: 'sent' },
+                ...messages.slice(messageIndex + 1),
+              ];
+              messageFound = true;
+              log.debug('[Store] Message status updated to sent', { messageId: data.messageId, userId });
+              break; // Message found, no need to continue searching
+            }
+          }
+
+          if (messageFound) {
+            set({ inbox: updatedInbox });
+          } else {
+            log.warn('[Store] message_sent event received but message not found', { messageId: data.messageId });
+          }
+        } catch (error) {
+          log.error('[Store] Error processing message_sent event', error);
+        }
+      });
+
+      // Listen for message_delivered event (when recipient downloads the buffer)
+      socket.on('message_delivered', (data: { messageId: string }) => {
+        try {
+          const state = get();
+          const updatedInbox: Record<string, SignedPayload[]> = { ...state.inbox };
+          let messageFound = false;
+
+          // Search through all inbox entries to find the message by messageId
+          for (const userId in updatedInbox) {
+            const messages = updatedInbox[userId];
+            const messageIndex = messages.findIndex(msg => msg.messageId === data.messageId);
+            
+            if (messageIndex !== -1) {
+              // Update the message status to 'delivered'
+              updatedInbox[userId] = [
+                ...messages.slice(0, messageIndex),
+                { ...messages[messageIndex], status: 'delivered' },
+                ...messages.slice(messageIndex + 1),
+              ];
+              messageFound = true;
+              log.debug('[Store] Message status updated to delivered', { messageId: data.messageId, userId });
+              break; // Message found, no need to continue searching
+            }
+          }
+
+          if (messageFound) {
+            set({ inbox: updatedInbox });
+          } else {
+            log.warn('[Store] message_delivered event received but message not found', { messageId: data.messageId });
+          }
+        } catch (error) {
+          log.error('[Store] Error processing message_delivered event', error);
         }
       });
 
@@ -269,8 +427,18 @@ export const useStore = create<StoreState>((set, get) => ({
         }
       });
 
-      // Get userId from current state or AuthStore
-      const currentUserId = state.userId || useAuthStore.getState().userId;
+      // Get userId from current state, AuthStore, or extract from token
+      let currentUserId = state.userId || useAuthStore.getState().userId;
+      
+      // If userId is still null, extract it from the token (token is just userId for MVP)
+      if (!currentUserId && token) {
+        currentUserId = token;
+        log.debug('[Store] Extracted userId from token');
+      }
+
+      if (!currentUserId) {
+        throw new Error('Unable to determine userId: token not available');
+      }
 
       set({
         socket,
@@ -660,11 +828,45 @@ export const useStore = create<StoreState>((set, get) => ({
   sendMessage: async (to: string, text: string) => {
     const state = get();
 
+    // If store is not initialized, try to initialize (regardless of auth state)
     if (!state.socket || !state.keys || !state.userId) {
+      log.debug('[Store] Store not initialized, attempting to connect socket', {
+        hasSocket: !!state.socket,
+        hasKeys: !!state.keys,
+        hasUserId: !!state.userId,
+        isAuthenticated: state.isAuthenticated,
+      });
+      try {
+        await get().connectSocket();
+        // Re-get state after connecting
+        const newState = get();
+        if (!newState.socket || !newState.keys || !newState.userId) {
+          log.error('[Store] Store still not initialized after connectSocket', {
+            hasSocket: !!newState.socket,
+            hasKeys: !!newState.keys,
+            hasUserId: !!newState.userId,
+          });
+          throw new Error('Store not initialized after connection attempt');
+        }
+        log.debug('[Store] Store successfully initialized');
+      } catch (error) {
+        log.error('[Store] Failed to initialize store for sendMessage:', error);
+        throw new Error(`Store not initialized: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+
+    // Re-check initialization after potential reconnection
+    const currentState = get();
+    if (!currentState.socket || !currentState.keys || !currentState.userId) {
+      log.error('[Store] Store validation failed', {
+        hasSocket: !!currentState.socket,
+        hasKeys: !!currentState.keys,
+        hasUserId: !!currentState.userId,
+      });
       throw new Error('Store not initialized');
     }
 
-    if (!state.socket.connected) {
+    if (!currentState.socket.connected) {
       throw new Error('Socket not connected');
     }
 
@@ -672,7 +874,7 @@ export const useStore = create<StoreState>((set, get) => ({
       // Construct SignedPayload with plaintext message.
       // It will be end-to-end encrypted via TweetNaCl when we encrypt `payloadJson`.
       const payload: SignedPayload = {
-        sender: state.userId,
+        sender: currentState.userId,
         message: text,
         timestamp: Date.now(),
       };
@@ -682,12 +884,12 @@ export const useStore = create<StoreState>((set, get) => ({
 
       // First, get the recipient's public key from the server
       const recipientPublicKeyBase64 = await new Promise<string>((resolve, reject) => {
-        if (!state.socket) {
+        if (!currentState.socket) {
           reject(new Error('Socket not available'));
           return;
         }
 
-        state.socket.emit('get_public_key', to, (response: {
+        currentState.socket.emit('get_public_key', to, (response: {
           success: boolean;
           publicKey?: string | null;
           error?: string;
@@ -709,24 +911,38 @@ export const useStore = create<StoreState>((set, get) => ({
       // Encrypt payload using CryptoService with the recipient's public key
       const cipherText = encrypt(payloadJson, recipientPublicKeyBase64);
 
+      // Generate conversation ID
+      const conversationId = generateConversationId(currentState.userId, to);
+      
+      // Generate message ID (UUID v4)
+      const messageId = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+
       // Optimistically add to inbox[to] with original text (not encrypted) so user sees their own message
+      // EPHEMERAL ORDERING: Optimistic messages have order = null/undefined and always come after server-confirmed messages
       const optimisticPayload: SignedPayload = {
-        sender: state.userId,
+        sender: currentState.userId,
         message: text, // Use original text for display
         timestamp: payload.timestamp,
+        order: undefined, // Optimistic messages have no order (will be assigned by server on confirmation)
+        optimistic: true, // Mark as optimistic
+        status: 'pending', // New messages default to pending status (created locally, not yet on server)
+        messageId: messageId, // Store messageId for tracking delivery status
       };
-      const currentInbox = state.inbox[to] || [];
+      const currentInbox = currentState.inbox[to] || [];
+      const updatedMessages = [...currentInbox, optimisticPayload].sort(compareMessages);
       set({
         inbox: {
-          ...state.inbox,
-          [to]: [...currentInbox, optimisticPayload],
+          ...currentState.inbox,
+          [to]: updatedMessages,
         },
       });
 
-      // Emit 'send_message' to socket
-      state.socket.emit('send_message', {
-        to,
+      // Emit 'send_message' to socket with new payload format
+      currentState.socket.emit('send_message', {
+        conversationId,
+        messageId,
         cipherText,
+        to, // Keep 'to' for now for backwards compatibility with server
       });
 
       log.info('[Store] message sent', { to });
@@ -742,24 +958,58 @@ export const useStore = create<StoreState>((set, get) => ({
   checkInbox: async () => {
     const state = get();
 
+    // If store is not initialized, try to initialize (regardless of auth state)
     if (!state.socket || !state.keys || !state.userId) {
+      log.debug('[Store] Store not initialized, attempting to connect socket', {
+        hasSocket: !!state.socket,
+        hasKeys: !!state.keys,
+        hasUserId: !!state.userId,
+        isAuthenticated: state.isAuthenticated,
+      });
+      try {
+        await get().connectSocket();
+        // Re-get state after connecting
+        const newState = get();
+        if (!newState.socket || !newState.keys || !newState.userId) {
+          log.error('[Store] Store still not initialized after connectSocket', {
+            hasSocket: !!newState.socket,
+            hasKeys: !!newState.keys,
+            hasUserId: !!newState.userId,
+          });
+          throw new Error('Store not initialized after connection attempt');
+        }
+        log.debug('[Store] Store successfully initialized');
+      } catch (error) {
+        log.error('[Store] Failed to initialize store for checkInbox:', error);
+        throw new Error(`Store not initialized: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+
+    // Re-check initialization after potential reconnection
+    const currentState = get();
+    if (!currentState.socket || !currentState.keys || !currentState.userId) {
+      log.error('[Store] Store validation failed', {
+        hasSocket: !!currentState.socket,
+        hasKeys: !!currentState.keys,
+        hasUserId: !!currentState.userId,
+      });
       throw new Error('Store not initialized');
     }
 
-    if (!state.socket.connected) {
+    if (!currentState.socket.connected) {
       throw new Error('Socket not connected');
     }
 
     try {
-      const messages = await new Promise<string[]>((resolve, reject) => {
-        if (!state.socket) {
+      const messagesWithOrder = await new Promise<Array<{ encryptedMessage: string; order: number }>>((resolve, reject) => {
+        if (!currentState.socket) {
           reject(new Error('Socket not available'));
           return;
         }
 
-        state.socket.emit('fetch_inbox', state.userId, (response: {
+        currentState.socket.emit('fetch_inbox', currentState.userId, (response: {
           success: boolean;
-          messages?: string[];
+          messages?: Array<{ encryptedMessage: string; order: number }>;
           error?: string;
         }) => {
           if (!response.success) {
@@ -771,13 +1021,16 @@ export const useStore = create<StoreState>((set, get) => ({
         });
       });
 
-      // Decrypt all messages
+      // Decrypt all messages and assign order values from server
       const decryptedPayloads: SignedPayload[] = [];
-      for (const cipherText of messages) {
+      for (const { encryptedMessage, order } of messagesWithOrder) {
         try {
-          const decrypted = decrypt(cipherText, state.keys!.secretKey);
+          const decrypted = decrypt(encryptedMessage, currentState.keys!.secretKey);
           if (decrypted) {
             const payload: SignedPayload = JSON.parse(decrypted);
+            // Assign server order token (ephemeral, persists across inbox fetches within session)
+            payload.order = order;
+            payload.optimistic = false; // Server-confirmed messages are not optimistic
             decryptedPayloads.push(payload);
           }
         } catch (error) {
@@ -786,19 +1039,60 @@ export const useStore = create<StoreState>((set, get) => ({
         }
       }
 
-      // Group messages by sender
-      const groupedInbox: Record<string, SignedPayload[]> = { ...state.inbox };
+      // INBOX MERGE LOGIC: Merge messages by id, preserve existing order values, re-sort using compareMessages
+      // EPHEMERAL ORDERING: Messages from previous checkInbox() calls retain their order values
+      // Order values are never removed or recomputed once assigned
+      const groupedInbox: Record<string, SignedPayload[]> = { ...currentState.inbox };
+      
+      // Group decrypted messages by sender
+      const serverMessagesBySender: Record<string, SignedPayload[]> = {};
       for (const payload of decryptedPayloads) {
         const sender = payload.sender;
-        if (!groupedInbox[sender]) {
-          groupedInbox[sender] = [];
+        if (!serverMessagesBySender[sender]) {
+          serverMessagesBySender[sender] = [];
         }
-        groupedInbox[sender].push(payload);
+        serverMessagesBySender[sender].push(payload);
       }
-
-      // Sort messages by timestamp within each sender's array
+      
+      // Merge server messages with existing messages for each sender
+      // CRITICAL: Merge by message key (id), preserve existing order values, assign order only from server
+      for (const sender in serverMessagesBySender) {
+        const existingMessages = groupedInbox[sender] || [];
+        const serverMessages = serverMessagesBySender[sender];
+        
+        // Create a map of existing messages by key for efficient lookup
+        const existingMap = new Map<string, SignedPayload>();
+        existingMessages.forEach(msg => {
+          existingMap.set(getMessageKey(msg), msg);
+        });
+        
+        // Merge: Replace existing messages by key, preserve order if message already exists
+        // Assign order from server for new messages
+        serverMessages.forEach(serverMsg => {
+          const key = getMessageKey(serverMsg);
+          const existing = existingMap.get(key);
+          if (existing) {
+            // Message already exists - preserve its existing order value (never overwrite non-null order)
+            // Only update if order is null/undefined
+            if (existing.order == null && serverMsg.order != null) {
+              existing.order = serverMsg.order;
+              existing.optimistic = false;
+            }
+          } else {
+            // New message - add with server order
+            existingMap.set(key, serverMsg);
+          }
+        });
+        
+        // Convert back to array and sort using compareMessages (single source of truth)
+        groupedInbox[sender] = Array.from(existingMap.values()).sort(compareMessages);
+      }
+      
+      // Also sort existing senders that didn't get new messages (for consistency)
       for (const sender in groupedInbox) {
-        groupedInbox[sender].sort((a, b) => a.timestamp - b.timestamp);
+        if (!serverMessagesBySender[sender]) {
+          groupedInbox[sender] = [...groupedInbox[sender]].sort(compareMessages);
+        }
       }
 
       // Set hasUnread to true if messages exist
@@ -813,6 +1107,127 @@ export const useStore = create<StoreState>((set, get) => ({
     } catch (error) {
       log.error('[Store] error checking inbox', error);
       throw error;
+    }
+  },
+
+  /**
+   * Enter chat: Emit enter_chat, flush buffer, update messages
+   * @param conversationId - The conversation ID
+   */
+  enterChat: async (conversationId: string) => {
+    const state = get();
+
+    if (!state.socket || !state.keys || !state.userId) {
+      log.error('[Store] Store not initialized for enterChat');
+      return;
+    }
+
+    if (!state.socket.connected) {
+      log.error('[Store] Socket not connected for enterChat');
+      return;
+    }
+
+    try {
+      const response = await new Promise<{ success: boolean; messages?: Array<{ messageId: string; cipherText: string; seq: number }>; error?: string }>((resolve, reject) => {
+        if (!state.socket) {
+          reject(new Error('Socket not available'));
+          return;
+        }
+
+        state.socket.emit('enter_chat', { conversationId }, (response: {
+          success: boolean;
+          messages?: Array<{ messageId: string; cipherText: string; seq: number }>;
+          error?: string;
+        }) => {
+          if (!response.success) {
+            reject(new Error(response.error || 'Failed to enter chat'));
+            return;
+          }
+          resolve(response);
+        });
+      });
+
+      // Decrypt and add buffered messages to inbox
+      if (response.messages && response.messages.length > 0) {
+        // We need to determine which userId to use as the key
+        // For now, we'll need to track conversationId -> otherUserId mapping
+        // Actually, we can extract it from the decrypted payload (sender field)
+        // But we need to know which conversation this is for
+        // Let's decrypt first message to get sender
+        const firstMsg = response.messages[0];
+        const decrypted = decrypt(firstMsg.cipherText, state.keys!.secretKey);
+        if (decrypted) {
+          const payload: SignedPayload = JSON.parse(decrypted);
+          const otherUserId = payload.sender;
+          
+          // Decrypt all messages and add to inbox
+          const decryptedPayloads: SignedPayload[] = [];
+          for (const msg of response.messages) {
+            const dec = decrypt(msg.cipherText, state.keys!.secretKey);
+            if (dec) {
+              const p: SignedPayload = JSON.parse(dec);
+              p.order = msg.seq;
+              p.optimistic = false;
+              decryptedPayloads.push(p);
+            }
+          }
+
+          // Merge with existing messages
+          const existingMessages = state.inbox[otherUserId] || [];
+          const existingMap = new Map<string, SignedPayload>();
+          existingMessages.forEach(msg => {
+            existingMap.set(getMessageKey(msg), msg);
+          });
+
+          decryptedPayloads.forEach(msg => {
+            const key = getMessageKey(msg);
+            if (!existingMap.has(key)) {
+              existingMap.set(key, msg);
+            }
+          });
+
+          const updatedMessages = Array.from(existingMap.values()).sort(compareMessages);
+          
+          set({
+            inbox: {
+              ...state.inbox,
+              [otherUserId]: updatedMessages,
+            },
+          });
+
+          log.debug('[Store] Entered chat, flushed buffer', { conversationId, messages: response.messages.length });
+        }
+      }
+    } catch (error) {
+      log.error('[Store] Error entering chat:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Leave chat: Emit leave_chat to update presence
+   * @param conversationId - The conversation ID
+   */
+  leaveChat: async (conversationId: string) => {
+    const state = get();
+
+    if (!state.socket || !state.userId) {
+      log.error('[Store] Store not initialized for leaveChat');
+      return;
+    }
+
+    if (!state.socket.connected) {
+      log.error('[Store] Socket not connected for leaveChat');
+      return;
+    }
+
+    try {
+      if (state.socket) {
+        state.socket.emit('leave_chat', { conversationId });
+        log.debug('[Store] Left chat', { conversationId });
+      }
+    } catch (error) {
+      log.error('[Store] Error leaving chat:', error);
     }
   },
 

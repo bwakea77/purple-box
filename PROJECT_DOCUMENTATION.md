@@ -3,7 +3,18 @@
 ## 1. Product Requirements Document (PRD)
 
 ### Goal
-Purple Box is a privacy-focused, ephemeral messaging application that enables secure, end-to-end encrypted communication between users. The core principle is that messages are **never persisted** - they exist only in RAM and are automatically wiped when the app goes to background or closes. The app follows a "box" metaphor where users receive notifications that "the box is full" when messages arrive, and must actively check their inbox to retrieve messages.
+Purple Box is a privacy-focused, **live conversation** application that enables secure, end-to-end encrypted communication between users. The core principle is that conversations exist **only while participants are present** - messages are never persisted to disk and are automatically wiped when users leave conversations or the app goes to background. The app follows a "live chat" model where conversations exist ephemerally based on user presence.
+
+### Product Promise
+
+> **"Live, private conversations that exist only while you're there."**
+
+**Not:**
+- Not async messaging
+- Not chat history
+- Not guaranteed delivery
+
+This must be **visible in UX, terminology, and system behavior**.
 
 ### Features List
 
@@ -14,14 +25,17 @@ Purple Box is a privacy-focused, ephemeral messaging application that enables se
 - **Persistent Auth State**: Auth tokens stored in Expo SecureStore (persists across app restarts)
 - **Push Notification Registration**: Automatic registration for Expo push notifications during OTP verification
 
-#### Messaging
+#### Messaging (Live Conversations)
 - **End-to-End Encrypted Messaging**: Messages encrypted using TweetNaCl (NaCl box encryption) with ephemeral key pairs
-- **Real-time Message Delivery**: Socket.io-based real-time messaging
-- **Ephemeral Message Storage**: Messages stored in Redis with 60-second TTL, automatically deleted after retrieval
-- **Inbox Management**: Users can view all messages grouped by sender
+- **Presence-Based Delivery**: Messages delivered directly via socket when recipient is in chat, buffered when idle/offline
+- **Conversation Model**: Conversations identified by deterministic hash of two user IDs
+- **Ephemeral Message Buffer**: Messages stored in Redis buffer (TTL 60s, max 20 messages) when recipient not in chat
+- **Real-time Delivery**: Direct socket-to-socket delivery when both users are in the same conversation
+- **Server Sequence Numbers**: Messages assigned sequence numbers per conversation for deterministic ordering
+- **Message Status Indicators**: Visual status indicators on sent messages (pending spinner, sent ✓, delivered ✓✓) displayed next to timestamps
 - **Chat Interface**: One-on-one chat interface with message history (RAM only)
-- **Message Wiping**: All messages wiped from RAM when app goes to background or closes
-- **Box Status Notifications**: Real-time "box_full" notifications when messages arrive
+- **Message Wiping**: All messages wiped from RAM when user leaves chat or app goes to background
+- **Push Notifications**: "Someone wants to chat" notification when recipient is offline
 
 #### Contacts
 - **Contact Sync**: Syncs device contacts with server to find registered users
@@ -37,10 +51,15 @@ Purple Box is a privacy-focused, ephemeral messaging application that enables se
 
 #### User Interface
 - **Home Screen**: Central box icon that pulses when messages are available
-- **Inbox List Screen**: Lists all senders with message counts
-- **Chat Screen**: One-on-one chat interface with message bubbles
 - **Contact Selection**: Screen to select recipient from synced contacts
-- **Dark Theme**: Black background with purple accent color (#8A2BE2)
+- **Chat Screen**: One-on-one chat interface with message bubbles
+  - **Message Bubbles**: Dark purple background (#4A148C) for sent messages, dark gray (#2C2C2C) for received messages
+  - **Status Indicators**: Visual delivery status indicators displayed next to message timestamps for sent messages:
+    - **Pending**: Purple spinner (ActivityIndicator) while message is being sent
+    - **Sent**: Single checkmark (✓) when message is acknowledged by server
+    - **Delivered**: Double checkmark (✓✓) when message is downloaded by recipient
+  - **Timestamps**: Displayed at bottom of each message bubble with 12-hour time format
+- **Dark Theme**: Black background with purple accent color (#8A2BE2 / #8B5CF6)
 
 ### User Roles
 Based on the authentication and authorization logic:
@@ -64,7 +83,7 @@ Based on the authentication and authorization logic:
 9. Server validates OTP, creates/updates user in Redis (`user:{phoneNumber}`), generates session token (userId)
 10. Client saves token to SecureStore, sets authenticated state, connects Socket.io
 11. Client emits `identify` event with token
-12. Server validates token, maps userId to socket, joins user to room
+12. Server validates token, maps userId to socket, sets initial presence to `ONLINE_IDLE`, joins user to room
 13. App navigates to HomeScreen (automatic via App.tsx routing logic)
 
 **Mermaid Diagram:**
@@ -99,36 +118,35 @@ sequenceDiagram
     C->>S: Connect Socket.io
     C->>S: emit('identify', {token})
     S->>R: Validate token (getUserByToken)
-    S->>S: Map userId to socket, join room
+    S->>S: Map userId to socket, set presence=ONLINE_IDLE, join room
     S-->>C: User identified
     C->>U: Navigate to HomeScreen
 ```
 
-### Critical Action 2: Sending a Message
+### Critical Action 2: Sending a Message (New Logic)
 
 **Text Description:**
 1. User on HomeScreen taps compose button → Navigate to ContactListScreen
 2. User selects contact → Navigate to ChatScreen with targetUser
-3. User types message and sends
-4. Client constructs SignedPayload (sender, encrypted message content, timestamp)
-5. Client encrypts message content with AES (crypto-js) using hardcoded secret key
-6. Client requests recipient's public key via Socket.io `get_public_key` event
-7. Server looks up recipient in userSockets map or Redis, returns public key
-8. Client encrypts entire payload JSON using TweetNaCl with recipient's public key (ephemeral key pair)
-9. Client optimistically adds message to local inbox (for immediate UI feedback)
-10. Client emits `send_message` event with {to: userId, cipherText: encryptedPayload}
-11. Server receives message, appends to Redis list `inbox:{userId}` with 60s TTL
-12. Server emits `box_status: 'FULL'` to recipient's room
-13. Server sends push notification to recipient (if push token exists)
-14. Server sends acknowledgment to sender
-15. Recipient receives `box_status` event, sets hasUnread flag
-16. When recipient opens inbox, emits `fetch_inbox` with userId
-17. Server retrieves all messages from Redis list, immediately deletes the key
-18. Server returns array of encrypted messages
-19. Client decrypts each message using TweetNaCl, then decrypts content with AES
-20. Client groups messages by sender, stores in RAM-only Zustand store
-21. Messages displayed in ChatScreen
-22. When user leaves ChatScreen or app goes to background, all messages wiped from RAM
+3. Client generates conversationId (hash of userId and targetUser)
+4. Client emits `enter_chat` with conversationId
+5. Server updates user presence to `IN_CHAT(conversationId)`, flushes buffer for conversation (if any)
+6. User types message and sends
+7. Client constructs SignedPayload (sender, message text, timestamp, status: 'pending')
+8. Client requests recipient's public key via Socket.io `get_public_key` event
+9. Server looks up recipient in userSockets map or Redis, returns public key
+10. Client encrypts payload JSON using TweetNaCl with recipient's public key
+11. Client generates messageId (UUID-style), generates conversationId
+12. Client optimistically adds message to local state
+13. Client emits `send_message` event with {conversationId, messageId, cipherText, to}
+14. **Server decision logic:**
+    - If recipient is `IN_CHAT(conversationId)`: Deliver directly via socket with sequence number, do NOT store
+    - If recipient is `ONLINE_IDLE`: Store in ephemeral buffer (Redis list, TTL 60s), emit `conversation_waiting`
+    - If recipient is `OFFLINE`: Store in buffer, send push notification "Someone wants to chat"
+15. Server assigns sequence number from conversation counter
+16. Recipient receives message (direct socket or from buffer on enter_chat)
+17. Messages displayed in ChatScreen sorted by sequence number
+18. When user leaves ChatScreen, emits `leave_chat`, presence → `ONLINE_IDLE`, messages wiped from RAM
 
 **Mermaid Diagram:**
 ```mermaid
@@ -139,31 +157,42 @@ sequenceDiagram
     participant Redis
     participant RC as Recipient Client
 
+    Sender->>SC: Select contact, navigate to ChatScreen
+    SC->>SC: Generate conversationId
+    SC->>Server: emit('enter_chat', {conversationId})
+    Server->>Server: Update presence to IN_CHAT(conversationId)
+    Server->>Redis: Flush buffer for conversationId
+    Redis-->>Server: Buffered messages (if any)
+    Server-->>SC: {success: true, messages: [...]}
+    
     Sender->>SC: Type message & send
-    SC->>SC: Encrypt content (AES)
-    SC->>SC: Create SignedPayload
-    SC->>Server: emit('get_public_key', recipientId)
-    Server->>Server: Lookup recipient public key
-    Server-->>SC: Return public key
-    SC->>SC: Encrypt payload (TweetNaCl)
-    SC->>SC: Optimistically add to inbox
-    SC->>Server: emit('send_message', {to, cipherText})
-    Server->>Redis: RPUSH inbox:{userId} cipherText
-    Server->>Redis: EXPIRE inbox:{userId} 60
-    Server->>RC: emit('box_status', 'FULL')
-    Server->>RC: Send push notification
-    Server-->>SC: Acknowledgment
-    RC->>RC: Set hasUnread = true
-    RC->>Server: emit('fetch_inbox', userId)
-    Server->>Redis: LRANGE inbox:{userId} 0 -1
-    Redis-->>Server: Array of messages
-    Server->>Redis: DEL inbox:{userId}
-    Server-->>RC: {success: true, messages: [...]}
-    RC->>RC: Decrypt each message (TweetNaCl)
-    RC->>RC: Decrypt content (AES)
-    RC->>RC: Group by sender, store in RAM
+    SC->>SC: Create SignedPayload, encrypt with TweetNaCl
+    SC->>Server: emit('send_message', {conversationId, messageId, cipherText, to})
+    Server->>Server: Check recipient presence
+    
+    alt Recipient is IN_CHAT(conversationId)
+        Server->>Server: Assign sequence number
+        Server->>RC: emit('receive_message', {conversationId, messageId, cipherText, seq})
+        Note over Server,RC: Direct socket delivery, no storage
+    else Recipient is ONLINE_IDLE
+        Server->>Redis: RPUSH buffer:conversationId (TTL 60s, max 20)
+        Server->>Server: Assign sequence number
+        Server->>RC: emit('conversation_waiting', {conversationId})
+        Note over Server,Redis: Message buffered
+    else Recipient is OFFLINE
+        Server->>Redis: RPUSH buffer:conversationId (TTL 60s, max 20)
+        Server->>Server: Assign sequence number
+        Server->>RC: Send push notification "Someone wants to chat"
+        Note over Server,Redis: Message buffered
+    end
+    
+    RC->>RC: Decrypt message, add to state (sorted by seq)
     RC->>RC: Display in ChatScreen
-    Note over RC: On background/close: Wipe all messages
+    
+    Note over SC: User leaves chat
+    SC->>Server: emit('leave_chat', {conversationId})
+    Server->>Server: Update presence to ONLINE_IDLE
+    SC->>SC: Wipe messages from RAM
 ```
 
 ---
@@ -182,7 +211,6 @@ sequenceDiagram
 - **Cryptography**: 
   - tweetnacl 1.0.3 (NaCl box encryption)
   - tweetnacl-util 0.15.1
-  - crypto-js 4.2.0 (AES encryption for message content)
 - **Security**: 
   - expo-secure-store ~14.0.0 (key and token storage)
   - expo-screen-capture ~6.0.1 (screenshot blocking)
@@ -196,7 +224,6 @@ sequenceDiagram
 - **Runtime**: Node.js (ESM modules)
 - **Real-time Communication**: Socket.io 4.8.3
 - **Socket.io Plugin**: fastify-socket.io 5.1.0
-- **Redis Adapter**: @socket.io/redis-adapter 8.3.0
 - **Database/Cache**: 
   - Redis 5.10.0 (via redis package)
   - ioredis 5.9.1 (alternative Redis client)
@@ -206,20 +233,69 @@ sequenceDiagram
 
 ### Architecture
 
-**Pattern**: Client-Server with Real-time WebSocket Communication
+**Pattern**: Client-Server with Real-time WebSocket Communication and Presence-Based Delivery
 
-The application follows a **hybrid architecture** combining:
+The application follows a **presence-aware architecture** combining:
 - **RESTful HTTP API** for authentication and contact syncing
-- **WebSocket (Socket.io)** for real-time messaging
-- **Ephemeral Redis Storage** for temporary message queuing
+- **WebSocket (Socket.io)** for real-time messaging with presence tracking
+- **Ephemeral Redis Buffer** for temporary message queuing (TTL-based, not persistent inbox)
 - **Client-Side State Management** for RAM-only message storage
+- **Presence Tracking** for intelligent message delivery
 
 **Key Architectural Decisions:**
 1. **Zero Persistence**: Messages never written to disk (client or server)
-2. **Ephemeral Redis**: All Redis keys have TTL (60s for messages, 5min for OTPs)
-3. **Client-Side Encryption**: Server never sees plaintext messages
-4. **Stateless Server**: Server maintains minimal in-memory state (userSockets map for active connections)
-5. **Push Notifications**: Used for offline message delivery
+2. **Ephemeral Buffer**: Messages stored in Redis buffer with 60s TTL, max 20 messages per conversation
+3. **Presence-Based Delivery**: Direct socket delivery when both users in chat, buffer when idle/offline
+4. **Conversation Model**: Conversations identified by deterministic hash of two user IDs
+5. **Server Sequence Numbers**: Messages assigned sequence numbers per conversation for ordering
+6. **Client-Side Encryption**: Server never sees plaintext messages
+7. **Stateful Server**: Server maintains presence state and conversation sequence counters in memory
+8. **Push Notifications**: Used for offline message delivery with honest messaging ("Someone wants to chat")
+
+### Presence Model
+
+**Presence States (server-tracked):**
+- `OFFLINE`: User not connected
+- `ONLINE_IDLE`: User connected but not in any chat
+- `IN_CHAT(conversationId)`: User is actively in a specific conversation
+
+**Presence Lifecycle:**
+1. User connects → `identify` → Presence set to `ONLINE_IDLE`
+2. User enters chat → `enter_chat` → Presence set to `IN_CHAT(conversationId)`, buffer flushed
+3. User leaves chat → `leave_chat` → Presence set to `ONLINE_IDLE`
+4. User disconnects → Presence cleared
+
+### Conversation Model
+
+**Conversation ID Generation:**
+```typescript
+conversationId = hash(userA, userB)  // Order-independent hash
+```
+
+- Uses simple hash function (djb2 algorithm) for deterministic IDs
+- Same two users always produce the same conversationId
+- Order-independent (userA, userB produces same ID as userB, userA)
+
+**Conversation Properties:**
+- Exists only while at least one user is present
+- Has no durable storage
+- Has short-lived buffer for handoff only (TTL 60s, max 20 messages)
+
+### Message Delivery Logic
+
+**Decision Tree:**
+```
+Recipient Presence State:
+├─ IN_CHAT(conversationId) → Direct socket delivery, no storage, assign seq
+├─ ONLINE_IDLE → Store in buffer, emit conversation_waiting, assign seq
+└─ OFFLINE → Store in buffer, send push notification, assign seq
+```
+
+**Sequence Numbers:**
+- Assigned server-side per conversation
+- Monotonic, incremental
+- Used for deterministic message ordering
+- Client sorts messages strictly by sequence number
 
 ### Folder Structure
 
@@ -231,7 +307,7 @@ box/
 │   │   ├── HomeScreen.tsx   # Main home screen with box icon
 │   │   ├── ChatScreen.tsx   # One-on-one chat interface
 │   │   ├── ContactListScreen.tsx  # Contact selection
-│   │   └── InboxListScreen.tsx     # Inbox list view
+│   │   └── InboxListScreen.tsx     # Legacy inbox list view
 │   ├── stores/              # Zustand state management stores
 │   │   ├── useStore.ts      # Main store (messages, socket, auth state)
 │   │   ├── useAuthStore.ts  # Authentication and key management
@@ -322,9 +398,6 @@ box/
    - Uses ephemeral key pairs (one-time keys per message)
    - Format: `[nonce(24 bytes) + ephemeralPublicKey(32 bytes) + encryptedMessage]`
    - Base64 encoded for transmission
-2. **Crypto-JS (AES)**: Additional encryption layer for message content
-   - Hardcoded secret key: `"the_fulcrum_protocol"`
-   - ⚠️ **Security Risk**: Hardcoded secret key is a major security vulnerability
 
 **Key Management**:
 - **Key Generation**: TweetNaCl `box.keyPair()` generates Ed25519 key pairs
@@ -336,16 +409,15 @@ box/
 
 **Message Storage**:
 - **Client**: Messages stored in RAM only (Zustand store)
-- **Server**: Messages stored in Redis with 60-second TTL
-- **Wiping**: All messages wiped from RAM when app goes to background/close
+- **Server**: Messages stored in Redis buffer (TTL 60s, max 20 per conversation)
+- **Wiping**: All messages wiped from RAM when user leaves chat or app goes to background/close
 - **Server-Side**: Server never decrypts messages (only handles encrypted payloads)
 
 **Security Features**:
 - ✅ **Screenshot Blocking**: `expo-screen-capture` prevents screenshots on all screens
 - ✅ **No Message Persistence**: Messages never written to disk
-- ✅ **Ephemeral Storage**: Redis messages auto-expire after 60 seconds
+- ✅ **Ephemeral Buffer**: Redis buffer has 60s TTL, max 20 messages per conversation
 - ✅ **End-to-End Encryption**: Server cannot read message content
-- ⚠️ **Hardcoded AES Key**: Major security vulnerability
 - ⚠️ **Weak Token Security**: Token is just userId (no cryptographic protection)
 
 ---
@@ -361,7 +433,7 @@ The application uses **Redis** as the primary data store. Redis is configured in
 ```mermaid
 erDiagram
     USER ||--o{ OTP : "has"
-    USER ||--o{ INBOX : "receives"
+    USER ||--o{ BUFFER : "has conversations"
     USER ||--o{ SOCKET : "connects via"
     
     USER {
@@ -378,10 +450,11 @@ erDiagram
         number ttl "300 seconds"
     }
     
-    INBOX {
-        string userId PK
+    BUFFER {
+        string conversationId PK
         array messages
         number ttl "60 seconds"
+        number maxSize "20 messages"
     }
     
     SOCKET {
@@ -389,6 +462,7 @@ erDiagram
         string userId FK
         string publicKey
         string pushToken
+        enum presence "OFFLINE|ONLINE_IDLE|IN_CHAT"
     }
 ```
 
@@ -422,15 +496,24 @@ erDiagram
   }
   ```
 
-**3. Inbox (Message Queue)**
-- **Key Pattern**: `inbox:{userId}`
+**3. Ephemeral Message Buffer (Live Message Buffer)**
+- **Key Pattern**: `buffer:{conversationId}`
 - **Type**: List (Redis LIST)
-- **TTL**: 60 seconds (refreshed on each message append)
-- **Structure**: Array of encrypted message strings (Base64)
-  - Each list item is a cipherText string (encrypted with TweetNaCl)
-  - Messages are appended via `RPUSH`
+- **TTL**: 60 seconds (auto-expires)
+- **Max Size**: 20 messages per conversation (FIFO when full)
+- **Structure**: Array of JSON strings
+  ```typescript
+  {
+    messageId: string;
+    cipherText: string;    // Base64 encoded encrypted payload
+    seq: number;          // Sequence number for ordering
+  }
+  ```
+- **Operations**:
+  - Messages appended via `RPUSH`
   - Retrieved via `LRANGE 0 -1` (all items)
-  - Deleted immediately after retrieval via `DEL`
+  - Deleted immediately after retrieval via `DEL` (or expires via TTL)
+  - TTL refreshed on each append
 
 **4. In-Memory Socket Mapping (Server Only)**
 - **Storage**: JavaScript object in server memory (not Redis)
@@ -442,25 +525,39 @@ erDiagram
       publicKey: string;
       pushToken: string | null;
       userId: string;
+      presence: 'OFFLINE' | 'ONLINE_IDLE' | { type: 'IN_CHAT'; conversationId: string };
     }
   }
   ```
-- **Purpose**: Maps active socket connections to user IDs for real-time message delivery
-- **Lifecycle**: Created on `identify` event, deleted on socket disconnect
+- **Purpose**: Maps active socket connections to user IDs for real-time message delivery and presence tracking
+- **Lifecycle**: Created on `identify` event (presence = ONLINE_IDLE), updated on `enter_chat`/`leave_chat`, deleted on socket disconnect
+
+**5. Conversation Sequence Counters (Server Only)**
+- **Storage**: JavaScript object in server memory (not Redis)
+- **Structure**:
+  ```typescript
+  {
+    [conversationId: string]: number;  // Next sequence number
+  }
+  ```
+- **Purpose**: Maintains monotonic sequence numbers per conversation for message ordering
+- **Lifecycle**: Created on first message in conversation, persists for conversation lifetime
 
 ### Data Relationships
 
 - **One User → One Profile**: Each phone number maps to one user profile
 - **One User → Multiple OTPs**: OTPs are created per authentication attempt (old OTPs overwritten)
-- **One User → One Inbox**: Each userId has one inbox list (multiple messages can be queued)
+- **One Conversation → One Buffer**: Each conversationId has one buffer list (max 20 messages, TTL 60s)
 - **One User → One Active Socket**: Each userId can have one active socket connection at a time (new connection overwrites old)
+- **One Conversation → One Sequence Counter**: Each conversation maintains its own sequence counter
 
 ### Notes
 
-- **No Traditional Database**: No SQL database or document store. All data in Redis.
+- **No Traditional Database**: No SQL database or document store. All data in Redis (except in-memory presence/sequence tracking).
 - **No Foreign Keys**: Redis doesn't enforce relationships. Application logic maintains referential integrity.
-- **Ephemeral by Design**: All message-related data expires. Only user profiles persist (until Redis restart).
+- **Ephemeral by Design**: Messages stored in buffer with 60s TTL. Client messages cleared when leaving chatroom. Only user profiles persist (until Redis restart).
 - **No Backup/Recovery**: No persistence means no data recovery. User profiles lost on Redis restart.
+- **Buffer vs Inbox**: The system uses "buffer" terminology to emphasize ephemeral, handoff-only storage, not persistent inbox.
 
 ---
 
@@ -593,7 +690,7 @@ erDiagram
 #### Client → Server Events
 
 **1. identify**
-- **Description**: Authenticate socket connection with token
+- **Description**: Authenticate socket connection with token, set initial presence
 - **Payload**:
   ```typescript
   {
@@ -601,6 +698,7 @@ erDiagram
   }
   ```
 - **Server Response**: None (implicit success) or `error` event on failure
+- **Server Action**: Sets user presence to `ONLINE_IDLE`, maps userId to socket
 
 **2. get_public_key**
 - **Description**: Get recipient's public key for encryption
@@ -619,26 +717,72 @@ erDiagram
 - **Payload**:
   ```typescript
   {
-    to: string;        // Recipient userId
-    cipherText: string; // Base64 encoded encrypted payload
+    conversationId: string;  // Hash of sender and recipient user IDs
+    messageId: string;       // Unique message identifier
+    cipherText: string;      // Base64 encoded encrypted payload
+    to: string;             // Recipient userId
   }
   ```
 - **Server Response**: None (implicit success) or `error` event on failure
+- **Server Logic**: 
+  - Checks recipient presence state
+  - If `IN_CHAT(conversationId)`: Direct socket delivery with sequence number
+  - If `ONLINE_IDLE`: Store in buffer, emit `conversation_waiting`
+  - If `OFFLINE`: Store in buffer, send push notification
 
-**4. fetch_inbox**
-- **Description**: Retrieve all messages from user's inbox
+**4. enter_chat**
+- **Description**: Enter a conversation, update presence, flush buffer
+- **Payload**:
+  ```typescript
+  {
+    conversationId: string;
+  }
+  ```
+- **Callback Response**:
+  ```typescript
+  {
+    success: boolean;
+    messages?: Array<{
+      messageId: string;
+      cipherText: string;
+      seq: number;
+    }>;
+    error?: string;
+  }
+  ```
+- **Server Action**: 
+  - Updates user presence to `IN_CHAT(conversationId)`
+  - Retrieves and deletes buffer for conversation
+  - Returns buffered messages sorted by sequence number
+
+**5. leave_chat**
+- **Description**: Leave a conversation, update presence back to ONLINE_IDLE
+- **Payload**:
+  ```typescript
+  {
+    conversationId: string;
+  }
+  ```
+- **Server Response**: None (implicit success)
+- **Server Action**: Updates user presence to `ONLINE_IDLE`
+
+**6. fetch_inbox** (Legacy, deprecated)
+- **Description**: Legacy inbox retrieval (kept for backwards compatibility)
 - **Payload**: `userId: string`
 - **Callback Response**:
   ```typescript
   {
     success: boolean;
-    messages?: string[];  // Array of encrypted message strings
+    messages?: Array<{
+      encryptedMessage: string;
+      order: number;
+    }>;
     error?: string;
   }
   ```
-- **Notes**: Inbox is deleted immediately after retrieval
+- **Notes**: This endpoint is deprecated. Use `enter_chat` instead.
 
-**5. get_contacts**
+**7. get_contacts**
 - **Description**: Get list of all online user IDs (legacy, deprecated)
 - **Payload**: None
 - **Callback Response**:
@@ -652,27 +796,35 @@ erDiagram
 
 #### Server → Client Events
 
-**1. box_status**
-- **Description**: Notification that inbox has messages
-- **Payload**: `"FULL"` (string)
-- **Trigger**: When message is appended to recipient's inbox
+**1. receive_message**
+- **Description**: Real-time message delivery when recipient is IN_CHAT
+- **Payload**:
+  ```typescript
+  {
+    conversationId: string;
+    messageId: string;
+    cipherText: string;
+    seq: number;  // Sequence number for ordering
+  }
+  ```
+- **Trigger**: When message is sent and recipient is `IN_CHAT(conversationId)`
 
-**2. error**
+**2. conversation_waiting**
+- **Description**: Notification that messages are waiting in buffer (recipient is ONLINE_IDLE)
+- **Payload**:
+  ```typescript
+  {
+    conversationId: string;
+  }
+  ```
+- **Trigger**: When message is buffered and recipient is `ONLINE_IDLE`
+
+**3. error**
 - **Description**: Error notification
 - **Payload**:
   ```typescript
   {
     message: string;
-  }
-  ```
-
-**3. message:ack**
-- **Description**: Message acknowledgment (legacy, from old server.ts)
-- **Payload**:
-  ```typescript
-  {
-    status: "success" | "error";
-    error?: string;
   }
   ```
 
@@ -720,35 +872,49 @@ erDiagram
 - Invalid public key format → 400
 - Server error → 500
 
-#### 2. Socket.io: send_message (Most Complex)
+#### 2. Socket.io: send_message (New Logic)
 
 **Request**:
 ```typescript
 socket.emit('send_message', {
-  to: "user_1234567890_abc123",
-  cipherText: "base64EncodedEncryptedPayload..."
+  conversationId: "abc123...",
+  messageId: "msg_123456",
+  cipherText: "base64EncodedEncryptedPayload...",
+  to: "user_1234567890_abc123"
 });
 ```
 
 **Process Flow**:
-1. Validate `to` and `cipherText` fields
-2. Append `cipherText` to Redis list `inbox:{userId}` via `RPUSH`
-3. Set/refresh TTL to 60 seconds on the inbox key
-4. Emit `box_status: 'FULL'` to recipient's Socket.io room
-5. Look up recipient's push token from `userSockets` map
-6. If push token exists and is valid Expo token, send push notification
-7. Log success (without logging message content)
+1. Validate `conversationId`, `messageId`, `cipherText`, and `to` fields
+2. Get sender userId from socket mapping
+3. Get recipient presence state
+4. Get next sequence number for conversation
+5. **Decision Logic**:
+   - If recipient is `IN_CHAT(conversationId)`:
+     - Emit `receive_message` directly to recipient socket
+     - Do NOT store in Redis
+   - If recipient is `ONLINE_IDLE`:
+     - Store message in Redis buffer (`buffer:{conversationId}`)
+     - Enforce max size (20 messages, FIFO)
+     - Set TTL to 60 seconds
+     - Emit `conversation_waiting` to recipient
+   - If recipient is `OFFLINE`:
+     - Store message in Redis buffer
+     - Set TTL to 60 seconds
+     - Send push notification ("Someone wants to chat")
+6. Log success (without logging message content)
 
 **Error Cases**:
-- Missing `to` or `cipherText` → `error` event
+- Missing required fields → `error` event
+- Sender not identified → `error` event
 - Redis operation failure → `error` event
 - Push notification failure → Logged but doesn't fail message delivery
 
-#### 3. Socket.io: fetch_inbox (Most Complex)
+#### 3. Socket.io: enter_chat (New)
 
 **Request**:
 ```typescript
-socket.emit('fetch_inbox', userId, (response) => {
+socket.emit('enter_chat', { conversationId: "abc123..." }, (response) => {
   // Handle response
 });
 ```
@@ -758,28 +924,46 @@ socket.emit('fetch_inbox', userId, (response) => {
 {
   success: true,
   messages: [
-    "base64EncryptedMessage1...",
-    "base64EncryptedMessage2...",
-    ...
+    {
+      messageId: "msg_123",
+      cipherText: "base64...",
+      seq: 0
+    },
+    {
+      messageId: "msg_124",
+      cipherText: "base64...",
+      seq: 1
+    }
   ]
 }
 ```
 
 **Process Flow**:
-1. Validate userId format
-2. Retrieve all messages from Redis list `inbox:{userId}` via `LRANGE 0 -1`
-3. Immediately delete the inbox key via `DEL` (prevents re-reading)
-4. Return array of encrypted message strings
-5. If inbox is empty, return empty array
+1. Validate conversationId format
+2. Get userId from socket mapping
+3. Update user presence to `IN_CHAT(conversationId)`
+4. Retrieve all messages from Redis buffer (`buffer:{conversationId}`)
+5. Delete buffer key from Redis
+6. Parse messages and sort by sequence number
+7. Return array of messages with sequence numbers
+8. If buffer is empty, return empty array
 
 **Error Cases**:
-- Invalid userId format → Callback with `{success: false, error: "Invalid user ID"}`
+- Invalid conversationId format → Callback with `{success: false, error: "Invalid conversation ID"}`
+- User not identified → Callback with error
 - Redis operation failure → Callback with error
 
-**Security Note**: Inbox is deleted immediately after retrieval, ensuring messages can only be read once.
+**Security Note**: Buffer is deleted immediately after retrieval, ensuring messages can only be read once.
 
 ---
 
 ## Summary
 
-This documentation provides a comprehensive overview of the Purple Box messaging application, covering product requirements, user journeys, technical architecture, security protocols, database schema, and API documentation. The application prioritizes privacy through ephemeral message storage, end-to-end encryption, and screenshot blocking, though some security improvements are needed (hardcoded AES key, weak token security) before production deployment.
+This documentation provides a comprehensive overview of the Purple Box messaging application, covering product requirements, user journeys, technical architecture, security protocols, database schema, and API documentation. The application prioritizes privacy through ephemeral message storage, end-to-end encryption, and screenshot blocking. The system implements a presence-based delivery model where conversations exist only while participants are present, with messages delivered directly when both users are in chat, or buffered temporarily (60s TTL) when recipients are idle or offline.
+
+**Key Design Principles:**
+- **Live Conversations**: Not async messaging, not chat history, not guaranteed delivery
+- **Presence Defines Existence**: Messages only exist while at least one participant is present
+- **Leaving = Forgetting**: Backgrounding, closing, or leaving chat erases local state
+- **Real-time First**: Socket delivery is primary, buffer is fallback only
+- **Loss is Acceptable, Confusion is Not**: Dropped messages are OK, reordered/duplicated messages are not

@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  Platform,
 } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
@@ -68,8 +69,40 @@ export default function OtpScreen({ navigation, route }: Props) {
   const { phoneNumber } = route.params;
   const [code, setCode] = useState(['', '', '', '', '', '']);
   const [isLoading, setIsLoading] = useState(false);
+  const [resendTimer, setResendTimer] = useState(120); // 2 minutes in seconds
+  const [isResendDisabled, setIsResendDisabled] = useState(true);
+  const [isResending, setIsResending] = useState(false);
   const inputRefs = useRef<Array<TextInput | null>>([]);
+  const autofillInputRef = useRef<TextInput | null>(null);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const login = useStore((state) => state.login);
+  const requestOtp = useStore((state) => state.requestOtp);
+
+  // Start resend timer on mount
+  useEffect(() => {
+    setResendTimer(120);
+    setIsResendDisabled(true);
+
+    // Start countdown timer
+    timerIntervalRef.current = setInterval(() => {
+      setResendTimer((prev) => {
+        if (prev <= 1) {
+          setIsResendDisabled(false);
+          if (timerIntervalRef.current) {
+            clearInterval(timerIntervalRef.current);
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     // Focus first input on mount
@@ -100,6 +133,72 @@ export default function OtpScreen({ navigation, route }: Props) {
         inputRefs.current[index - 1]?.focus();
       }
     }
+  };
+
+  // Handle SMS autofill
+  const handleAutofillChange = (value: string) => {
+    // Extract only digits
+    const digits = value.replace(/[^0-9]/g, '').slice(0, 6);
+    
+    if (digits.length === 6) {
+      // Split into array and update code
+      const newCode = digits.split('');
+      setCode(newCode);
+      
+      // Focus last input
+      inputRefs.current[5]?.focus();
+    }
+  };
+
+  const handleResendCode = async () => {
+    if (isResendDisabled || isResending) return;
+
+    setIsResending(true);
+
+    try {
+      const result = await requestOtp(phoneNumber);
+      
+      if (!result.success) {
+        Alert.alert('Error', result.error || 'Failed to resend code');
+        return;
+      }
+
+      // Reset timer
+      setResendTimer(120);
+      setIsResendDisabled(true);
+
+      // Clear existing interval
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
+
+      // Start new countdown
+      timerIntervalRef.current = setInterval(() => {
+        setResendTimer((prev) => {
+          if (prev <= 1) {
+            setIsResendDisabled(false);
+            if (timerIntervalRef.current) {
+              clearInterval(timerIntervalRef.current);
+            }
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+
+      Alert.alert('Success', 'Verification code resent');
+    } catch (error) {
+      log.error('[OtpScreen] error resending code', error);
+      Alert.alert('Error', 'Failed to resend code. Please try again.');
+    } finally {
+      setIsResending(false);
+    }
+  };
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   const handleKeyPress = (key: string, index: number) => {
@@ -169,10 +268,31 @@ export default function OtpScreen({ navigation, route }: Props) {
     <View style={styles.container}>
       <View style={styles.content}>
         <Text style={styles.title}>Enter Verification Code</Text>
-        <Text style={styles.subtitle}>
-          Enter the code sent to{'\n'}
-          <Text style={styles.phoneNumber}>{phoneNumber}</Text>
-        </Text>
+        <View style={styles.phoneNumberContainer}>
+          <Text style={styles.subtitle}>
+            Enter the code sent to{'\n'}
+            <Text style={styles.phoneNumber}>{phoneNumber}</Text>
+          </Text>
+          <TouchableOpacity
+            onPress={() => navigation.goBack()}
+            style={styles.editLink}
+            disabled={isLoading}
+          >
+            <Text style={styles.editLinkText}>Edit / Wrong number?</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Hidden TextInput for SMS autofill */}
+        <TextInput
+          ref={autofillInputRef}
+          style={styles.autofillInput}
+          value=""
+          onChangeText={handleAutofillChange}
+          keyboardType="number-pad"
+          autoComplete={Platform.OS === 'android' ? 'sms-otp' : 'off'}
+          textContentType={Platform.OS === 'ios' ? 'oneTimeCode' : undefined}
+          maxLength={6}
+        />
 
         <View style={styles.codeContainer}>
           {code.map((digit, index) => (
@@ -203,6 +323,25 @@ export default function OtpScreen({ navigation, route }: Props) {
             <Text style={styles.buttonText}>Verify</Text>
           )}
         </TouchableOpacity>
+
+        <View style={styles.resendContainer}>
+          <Text style={styles.resendText}>Didn't receive the code? </Text>
+          <TouchableOpacity
+            onPress={handleResendCode}
+            disabled={isResendDisabled || isResending}
+            style={styles.resendButton}
+          >
+            {isResendDisabled ? (
+              <Text style={styles.resendButtonTextDisabled}>
+                Resend code ({formatTime(resendTimer)})
+              </Text>
+            ) : (
+              <Text style={styles.resendButtonText}>
+                {isResending ? 'Resending...' : 'Resend code'}
+              </Text>
+            )}
+          </TouchableOpacity>
+        </View>
       </View>
     </View>
   );
@@ -226,15 +365,36 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     textAlign: 'center',
   },
+  phoneNumberContainer: {
+    alignItems: 'center',
+    marginBottom: 40,
+    width: '100%',
+  },
   subtitle: {
     fontSize: 16,
     color: '#888888',
-    marginBottom: 40,
     textAlign: 'center',
+    marginBottom: 8,
   },
   phoneNumber: {
     color: '#FFFFFF',
     fontWeight: '600',
+  },
+  editLink: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  editLinkText: {
+    color: '#9333EA',
+    fontSize: 14,
+    fontWeight: '500',
+    textDecorationLine: 'underline',
+  },
+  autofillInput: {
+    position: 'absolute',
+    opacity: 0,
+    width: 1,
+    height: 1,
   },
   codeContainer: {
     flexDirection: 'row',
@@ -270,5 +430,30 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  resendContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 20,
+    flexWrap: 'wrap',
+  },
+  resendText: {
+    color: '#888888',
+    fontSize: 14,
+  },
+  resendButton: {
+    paddingVertical: 4,
+    paddingHorizontal: 4,
+  },
+  resendButtonText: {
+    color: '#9333EA',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  resendButtonTextDisabled: {
+    color: '#555555',
+    fontSize: 14,
+    fontWeight: '500',
   },
 });

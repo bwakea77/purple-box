@@ -35,11 +35,8 @@ class MainApplication : Application(), ReactApplication {
       }
   )
 
-  // Must be a single instance. Creating a new ReactHost on each access can initialize
-  // React twice and crash Expo DevLauncher ("App react context shouldn't be created before.").
-  override val reactHost: ReactHost by lazy {
-    ReactNativeHostWrapper.createReactHost(applicationContext, reactNativeHost)
-  }
+  override val reactHost: ReactHost
+    get() = ReactNativeHostWrapper.createReactHost(applicationContext, reactNativeHost)
 
   override fun onCreate() {
     super.onCreate()
