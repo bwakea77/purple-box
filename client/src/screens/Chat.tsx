@@ -47,13 +47,40 @@ export default function Chat(): JSX.Element {
   const peerNickname = useChatStore((s) => s.peerNickname);
   const peerPresence = useChatStore((s) => s.peerPresence);
   const connectionLost = useChatStore((s) => s.connectionLost);
+  const keyPair = useChatStore((s) => s.keyPair);
+  const peerPublicKey = useChatStore((s) => s.peerPublicKey);
   const [draft, setDraft] = useState('');
   const [warning, setWarning] = useState<string | null>(null);
+  const [sasCode, setSasCode] = useState<string[] | 'unsupported' | null>(null);
+  const [showVerify, setShowVerify] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [messages.length]);
+
+  // Recomputed whenever the peer's key changes — including a reconnect that
+  // hands them a fresh session keypair, which should invalidate any prior
+  // out-of-band verification.
+  useEffect(() => {
+    if (!keyPair || !peerPublicKey) {
+      setSasCode(null);
+      return;
+    }
+    if (!Crypto.isSasSupported()) {
+      // Deliberately surfaced rather than left as a dead button: this app's
+      // own principle is to never imply protection you don't have.
+      setSasCode('unsupported');
+      return;
+    }
+    let cancelled = false;
+    void Crypto.computeSasCode(keyPair.publicKey, peerPublicKey).then((code) => {
+      if (!cancelled) setSasCode(code);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [keyPair, peerPublicKey]);
 
   const composerDisabled = peerPresence === 'PEER_LEFT' || connectionLost;
 
@@ -81,10 +108,38 @@ export default function Chat(): JSX.Element {
           <div className="peer-name">{peerNickname ?? 'Peer'}</div>
         </div>
         <PresenceBadge />
+        <button
+          className="btn btn-secondary"
+          onClick={() => setShowVerify((v) => !v)}
+          disabled={!sasCode}
+          style={{ minHeight: 36, padding: '6px 12px' }}
+        >
+          🛡️ Verify
+        </button>
         <button className="btn btn-secondary" onClick={handleLeave} style={{ minHeight: 36, padding: '6px 12px' }}>
           Leave
         </button>
       </div>
+
+      {showVerify && sasCode === 'unsupported' && (
+        <div className="sas-panel">
+          <p className="error-text">
+            Safety code unavailable — this connection isn't secure enough for your browser to compute one (it needs
+            HTTPS). Nothing here is preventing a compromised server from swapping keys undetected right now.
+          </p>
+        </div>
+      )}
+
+      {showVerify && Array.isArray(sasCode) && (
+        <div className="sas-panel">
+          <div className="sas-emoji">{sasCode.join('  ')}</div>
+          <p className="hint-text">
+            Read this out loud or compare in person — don't paste it in the chat. If it matches what{' '}
+            {peerNickname ?? 'your peer'} sees, no one is intercepting your keys. If it doesn't match, leave and
+            start a new room.
+          </p>
+        </div>
+      )}
 
       {connectionLost && (
         <p className="error-text" style={{ padding: '8px 16px', margin: 0 }}>

@@ -247,8 +247,24 @@ async function deliver(messageId: string, plaintext: string): Promise<void> {
   }
 }
 
+// crypto.randomUUID() only exists in secure contexts (https:// or localhost);
+// a plain-http deployment on a raw IP/hostname has it undefined, which broke
+// every send at the first line before the message ever reached the store.
+// messageId is just a client-side correlation id, not security-sensitive, so
+// a Math.random-based fallback is fine here.
+function generateMessageId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export async function sendMessage(plaintext: string): Promise<void> {
-  const messageId = crypto.randomUUID();
+  const messageId = generateMessageId();
   useChatStore.getState().addMessage({
     messageId,
     text: plaintext,
